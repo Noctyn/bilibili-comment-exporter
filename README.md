@@ -32,12 +32,11 @@
 
 | 展开控制面板 | 导出数据进行中 |
 | :---: | :---: |
-| ![设置](./assets/设置.png) | ![导出中](./assets/导出中.png) |
+| ![设置](https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/assets/%E8%AE%BE%E7%BD%AE.png) | ![导出中](https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/assets/%E5%AF%BC%E5%87%BA%E4%B8%AD.png) |
 
 | 实时数据看板 | 页面悬浮按钮 |
 | :---: | :---: |
-| ![统计页面](./assets/统计页面.png) | ![导出评论按钮](./assets/导出评论按钮.png) |
-
+| ![统计页面](https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/assets/%E7%BB%9F%E8%AE%A1%E9%A1%B5%E9%9D%A2.png) | ![导出评论按钮](https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/assets/%E5%AF%BC%E5%87%BA%E8%AF%84%E8%AE%BA%E6%8C%89%E9%92%AE.png) |
 ---
 
 ## 📂 项目结构
@@ -65,11 +64,8 @@ bilibili-comment-exporter/
 *   [Violentmonkey (暴力猴)](https://violentmonkey.github.io/)
 
 ### 2. 安装脚本
-1.  复制本项目中的 [bilibili_comment_exporter.user.js](./bilibili_comment_exporter.user.js) 文件的全部代码。
-2.  点击浏览器右上角油猴图标 -> **添加新脚本**。
-3.  清除编辑器中的默认模版代码，粘贴刚才复制的内容。
-4.  按下 `Ctrl + S`（或点击左上角 文件 -> 保存）即可完成安装。
-
+*   👉 **[从 Greasy Fork 安装](https://greasyfork.org/zh-CN/scripts/582735)**（推荐）
+*   👉 **[从 GitHub 直接安装](https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js)**
 ---
 
 ## 🛠️ 使用说明
