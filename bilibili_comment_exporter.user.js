@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/bilibili-comment-exporter/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
-// @version      0.5.0
+// @version      0.5.0.1
 // @description  一款基于 Bilibili API 的视频评论区导出工具，入口集成在视频工具栏与 UP 主空间页中，支持导出主评论和楼中楼为 CSV（UTF-8 BOM 防乱码），并带有实时 IP 属地、等级及性别数据统计看板。
 // @author       heroxv
 // @license      MIT
@@ -16,7 +16,7 @@
 // @run-at       document-end
 // ==/UserScript==
 
-(function() {
+(function () {
     'use strict';
 
     // ==========================================
@@ -1716,7 +1716,7 @@
             main: 0,
             sub: 0,
             ip: {},
-            level: {1:0, 2:0, 3:0, 4:0, 5:0, 6:0},
+            level: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 },
             sex: { '男': 0, '女': 0, '保密': 0 }
         };
     }
@@ -2974,11 +2974,11 @@
         };
         const origPushState = history.pushState;
         const origReplaceState = history.replaceState;
-        history.pushState = function(...args) {
+        history.pushState = function (...args) {
             origPushState.apply(this, args);
             notify();
         };
-        history.replaceState = function(...args) {
+        history.replaceState = function (...args) {
             origReplaceState.apply(this, args);
             notify();
         };
