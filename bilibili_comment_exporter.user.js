@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/bilibili-comment-exporter/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
-// @version      0.4.1
+// @version      0.5.0
 // @description  一款基于 Bilibili API 的视频评论区导出工具，入口集成在视频工具栏与 UP 主空间页中，支持导出主评论和楼中楼为 CSV（UTF-8 BOM 防乱码），并带有实时 IP 属地、等级及性别数据统计看板。
 // @author       heroxv
 // @license      MIT
@@ -634,28 +634,36 @@
 
     // ==========================================
     // 5. CSS Styling (Injected)
+    // 设计语言对齐 B 站 Web 端：品牌粉 #FB7299、扁平白卡、1px 细边框、12px 圆角，
+    // 文字层级 18191C / 61666D / 9499A0，避免玻璃拟态与渐变大圆角等非原生元素。
     // ==========================================
+    const BCE_FONT = '"PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+
     const CSS_STYLES = `
         /* ========== 视频工具栏入口 ========== */
         .bili-cmt-entry {
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 6px;
             cursor: pointer;
             font-size: 13px;
             font-weight: 500;
+            line-height: 1;
             color: #61666d;
             height: 100%;
-            padding: 0 2px;
+            padding: 0 6px;
+            border-radius: 6px;
             user-select: none;
             -webkit-user-select: none;
             white-space: nowrap;
-            transition: color 0.2s ease, transform 0.15s ease;
+            transition: color 0.2s ease, background-color 0.2s ease;
+            font-family: ${BCE_FONT};
         }
         .bili-cmt-entry:hover { color: #00aeec; }
-        .bili-cmt-entry:active { transform: scale(0.93); }
-        .bili-cmt-entry svg { display: block; width: 26px; height: 26px; flex-shrink: 0; }
-        .bili-cmt-entry.bili-cmt-dark { color: #a2aab3; }
+        .bili-cmt-entry:active { color: #00a1d6; }
+        .bili-cmt-entry:focus-visible { outline: 2px solid #00aeec; outline-offset: 2px; }
+        .bili-cmt-entry svg { display: block; width: 24px; height: 24px; flex-shrink: 0; }
+        .bili-cmt-entry.bili-cmt-dark { color: #a2a7ae; }
         .bili-cmt-entry.bili-cmt-dark:hover { color: #40c4f5; }
 
         /* ========== 空间页入口 ========== */
@@ -663,97 +671,105 @@
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            gap: 5px;
+            gap: 6px;
             height: 34px;
             padding: 0 16px;
             margin-left: 8px;
-            border-radius: 6px;
-            background: rgba(255, 255, 255, 0.14);
+            border: none;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.2);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
             color: #fff;
             font-size: 14px;
-            font-weight: 700;
-            font-family: "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", -apple-system, sans-serif;
+            font-weight: 600;
+            line-height: 1;
+            font-family: ${BCE_FONT};
             cursor: pointer;
             user-select: none;
             -webkit-user-select: none;
             white-space: nowrap;
-            transition: background 0.2s ease, transform 0.15s ease;
+            transition: background-color 0.2s ease, transform 0.15s ease;
         }
-        .bili-cmt-entry-space:hover { background: rgba(255, 255, 255, 0.26); }
-        .bili-cmt-entry-space:active { transform: scale(0.96); }
-        .bili-cmt-entry-space svg { width: 18px; height: 18px; }
+        .bili-cmt-entry-space:hover { background: rgba(255, 255, 255, 0.3); }
+        .bili-cmt-entry-space:active { transform: scale(0.97); }
+        .bili-cmt-entry-space:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+        .bili-cmt-entry-space svg { width: 16px; height: 16px; }
         .bili-cmt-entry-space.bili-cmt-entry-space-legacy {
             height: 38px;
             background: #f1f2f3;
             color: #61666d;
+            backdrop-filter: none;
+            -webkit-backdrop-filter: none;
         }
         .bili-cmt-entry-space.bili-cmt-entry-space-legacy:hover { background: #e3e5e7; color: #fb7299; }
 
-        /* ========== Toast 通知 ========== */
+        /* ========== Toast ========== */
         .bili-cmt-toast-container {
             position: fixed;
-            top: 20px;
+            top: 24px;
             left: 50%;
             transform: translateX(-50%);
             z-index: 2147483647;
             display: flex;
             flex-direction: column;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
             pointer-events: none;
-            font-family: "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", -apple-system, sans-serif;
+            font-family: ${BCE_FONT};
         }
         .bili-cmt-toast {
             pointer-events: auto;
             display: flex;
             align-items: center;
             gap: 8px;
-            background: rgba(28, 30, 33, 0.92);
+            background: rgba(24, 25, 28, 0.92);
             color: #fff;
             font-size: 13px;
             font-weight: 500;
-            padding: 10px 18px;
-            border-radius: 12px;
-            box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
-            animation: bceToastIn 0.28s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+            padding: 10px 16px;
+            border-radius: 8px;
+            box-shadow: 0 6px 24px rgba(0, 0, 0, 0.2);
+            animation: bceToastIn 0.22s ease;
             max-width: 68vw;
-            word-break: break-all;
+            word-break: break-word;
             line-height: 1.4;
         }
         .bili-cmt-toast svg { width: 16px; height: 16px; flex-shrink: 0; }
-        .bili-cmt-toast.success svg { color: #6ede9c; }
-        .bili-cmt-toast.error svg { color: #ff8f8f; }
-        .bili-cmt-toast.info svg { color: #7fd0ff; }
-        .bili-cmt-toast.out { animation: bceToastOut 0.22s ease forwards; }
+        .bili-cmt-toast.success svg { color: #5ad48a; }
+        .bili-cmt-toast.error svg { color: #ff7a7a; }
+        .bili-cmt-toast.info svg { color: #60c8f5; }
+        .bili-cmt-toast.out { animation: bceToastOut 0.2s ease forwards; }
         @keyframes bceToastIn {
-            from { opacity: 0; transform: translateY(-14px) scale(0.94); }
-            to { opacity: 1; transform: translateY(0) scale(1); }
+            from { opacity: 0; transform: translateY(-12px); }
+            to { opacity: 1; transform: translateY(0); }
         }
         @keyframes bceToastOut {
-            to { opacity: 0; transform: translateY(-10px) scale(0.94); }
+            to { opacity: 0; transform: translateY(-8px); }
         }
 
-        /* ========== 控制面板 ========== */
+        /* ========== 面板基础 ========== */
         .bili-cmt-panel {
-            --bce-accent: #fb7299;
-            --bce-accent-strong: #f25d8e;
-            --bce-accent-soft: rgba(251, 114, 153, 0.12);
+            /* 浅色主题令牌（对齐 B 站 Web 端取色） */
+            --bce-brand: #fb7299;
+            --bce-brand-hover: #ff85ad;
+            --bce-brand-active: #e45c87;
+            --bce-brand-weak: rgba(251, 114, 153, 0.1);
             --bce-blue: #00aeec;
+            --bce-green: #0fa958;
+            --bce-orange: #ff8a00;
+            --bce-red: #f45b5b;
             --bce-text-1: #18191c;
             --bce-text-2: #61666d;
             --bce-text-3: #9499a0;
-            --bce-fill-1: rgba(0, 0, 0, 0.035);
-            --bce-fill-2: rgba(0, 0, 0, 0.07);
-            --bce-line: rgba(0, 0, 0, 0.08);
-            --bce-input-bg: rgba(0, 0, 0, 0.02);
-            --bce-input-line: rgba(0, 0, 0, 0.15);
-            --bce-card: rgba(255, 255, 255, 0.6);
-            --bce-glass: rgba(255, 255, 255, 0.88);
+            --bce-line: #e3e5e7;
+            --bce-line-weak: #f1f2f3;
+            --bce-fill-1: #f6f7f8;
+            --bce-fill-2: #f1f2f3;
+            --bce-surface: #ffffff;
             --bce-seg-active: #ffffff;
-            --bce-console-bg: rgba(0, 0, 0, 0.035);
-            --bce-shadow: 0 24px 64px rgba(0, 0, 0, 0.16), 0 2px 10px rgba(0, 0, 0, 0.06);
+            --bce-shadow: 0 12px 40px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.04);
+            --bce-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06);
 
             position: fixed;
             right: 24px;
@@ -761,190 +777,200 @@
             width: 460px;
             max-width: calc(100vw - 32px);
             z-index: 100000;
-            background: var(--bce-glass);
-            backdrop-filter: blur(24px) saturate(1.4);
-            -webkit-backdrop-filter: blur(24px) saturate(1.4);
+            background: var(--bce-surface);
             border: 1px solid var(--bce-line);
-            border-radius: 18px;
+            border-radius: 12px;
             box-shadow: var(--bce-shadow);
-            padding: 18px 20px 20px;
-            font-family: "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-family: ${BCE_FONT};
             color: var(--bce-text-1);
             display: flex;
             flex-direction: column;
-            gap: 14px;
-            max-height: min(82vh, 760px);
+            max-height: min(88vh, 800px);
             overflow: hidden;
             box-sizing: border-box;
             text-align: left;
+            -webkit-font-smoothing: antialiased;
             opacity: 0;
             visibility: hidden;
-            transform: translateY(14px) scale(0.97);
-            transition: opacity 0.22s ease, transform 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.15), visibility 0.22s;
+            transform: translateY(8px) scale(0.99);
+            transition: opacity 0.2s ease, transform 0.2s cubic-bezier(0.22, 0.61, 0.36, 1), visibility 0.2s;
         }
-        .bili-cmt-panel.bili-cmt-open {
-            opacity: 1;
-            visibility: visible;
-            transform: translateY(0) scale(1);
-        }
-        .bili-cmt-panel.bili-cmt-dragging { transition: none; }
+        .bili-cmt-panel.bili-cmt-open { opacity: 1; visibility: visible; transform: none; }
+        .bili-cmt-panel.bili-cmt-dragging { transition: none; user-select: none; }
         .bili-cmt-panel.bili-cmt-dark {
+            --bce-brand-weak: rgba(251, 114, 153, 0.16);
             --bce-text-1: #e3e5e7;
-            --bce-text-2: #a2aab3;
+            --bce-text-2: #a2a7ae;
             --bce-text-3: #71767d;
-            --bce-fill-1: rgba(255, 255, 255, 0.06);
-            --bce-fill-2: rgba(255, 255, 255, 0.1);
-            --bce-line: rgba(255, 255, 255, 0.1);
-            --bce-input-bg: rgba(255, 255, 255, 0.05);
-            --bce-input-line: rgba(255, 255, 255, 0.16);
-            --bce-card: rgba(255, 255, 255, 0.04);
-            --bce-glass: rgba(22, 24, 27, 0.92);
-            --bce-seg-active: rgba(255, 255, 255, 0.16);
-            --bce-console-bg: rgba(0, 0, 0, 0.25);
-            --bce-shadow: 0 24px 64px rgba(0, 0, 0, 0.55), 0 2px 10px rgba(0, 0, 0, 0.4);
+            --bce-line: #2f3134;
+            --bce-line-weak: #26282b;
+            --bce-fill-1: #1b1c1f;
+            --bce-fill-2: #26282b;
+            --bce-surface: #212226;
+            --bce-seg-active: #34373b;
+            --bce-shadow: 0 12px 40px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.4);
+            --bce-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
         }
 
-        .bili-cmt-panel::-webkit-scrollbar,
-        .bili-cmt-body::-webkit-scrollbar,
-        .bili-cmt-console::-webkit-scrollbar {
-            width: 6px;
-        }
-        .bili-cmt-panel::-webkit-scrollbar-track,
-        .bili-cmt-body::-webkit-scrollbar-track,
-        .bili-cmt-console::-webkit-scrollbar-track { background: transparent; }
-        .bili-cmt-panel::-webkit-scrollbar-thumb,
-        .bili-cmt-body::-webkit-scrollbar-thumb,
-        .bili-cmt-console::-webkit-scrollbar-thumb {
-            background: var(--bce-fill-2);
-            border-radius: 10px;
-        }
+        .bili-cmt-panel ::-webkit-scrollbar { width: 6px; height: 6px; }
+        .bili-cmt-panel ::-webkit-scrollbar-track { background: transparent; }
+        .bili-cmt-panel ::-webkit-scrollbar-thumb { background: var(--bce-line); border-radius: 3px; }
+        .bili-cmt-panel ::-webkit-scrollbar-thumb:hover { background: var(--bce-text-3); }
 
+        /* ========== 头部 ========== */
         .bili-cmt-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 12px;
+            padding: 14px 16px 14px 20px;
+            border-bottom: 1px solid var(--bce-line-weak);
             cursor: grab;
+            flex-shrink: 0;
             user-select: none;
             -webkit-user-select: none;
         }
         .bili-cmt-header:active { cursor: grabbing; }
 
+        .bili-cmt-title-area { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
         .bili-cmt-title-area h3 {
             margin: 0;
-            font-size: 17px;
-            font-weight: 800;
-            letter-spacing: 0.5px;
-            background: linear-gradient(90deg, var(--bce-accent), #e03e7a);
-            -webkit-background-clip: text;
-            background-clip: text;
-            -webkit-text-fill-color: transparent;
+            font-size: 15px;
+            font-weight: 600;
+            line-height: 20px;
+            color: var(--bce-text-1);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        /* B 站常见的小标题前缀竖条 */
+        .bili-cmt-title-area h3::before {
+            content: "";
+            width: 3px;
+            height: 14px;
+            border-radius: 2px;
+            background: var(--bce-brand);
         }
         .bili-cmt-subtitle {
-            font-size: 10px;
+            font-size: 12px;
+            line-height: 16px;
             color: var(--bce-text-3);
-            display: block;
-            margin-top: 2px;
-            letter-spacing: 0.3px;
+            padding-left: 11px;
         }
         .bili-cmt-icon-btn {
+            flex-shrink: 0;
             background: transparent;
             border: none;
             color: var(--bce-text-3);
             cursor: pointer;
-            width: 30px;
-            height: 30px;
+            width: 28px;
+            height: 28px;
             display: flex;
             align-items: center;
             justify-content: center;
-            border-radius: 50%;
-            transition: all 0.2s;
+            border-radius: 6px;
+            transition: background-color 0.2s ease, color 0.2s ease;
             outline: none;
             padding: 0;
         }
-        .bili-cmt-icon-btn:hover {
-            color: var(--bce-accent);
-            background: var(--bce-accent-soft);
-        }
-        .bili-cmt-icon-btn svg { width: 17px; height: 17px; }
+        .bili-cmt-icon-btn:hover { color: var(--bce-text-1); background: var(--bce-fill-2); }
+        .bili-cmt-icon-btn:active { background: var(--bce-line); }
+        .bili-cmt-icon-btn:focus-visible { outline: 2px solid var(--bce-brand); outline-offset: 1px; }
+        .bili-cmt-icon-btn svg { width: 16px; height: 16px; }
 
+        /* ========== 内容区 ========== */
         .bili-cmt-body {
             position: relative;
             display: flex;
             flex-direction: column;
-            gap: 14px;
+            gap: 16px;
             min-height: 0;
             overflow-y: auto;
-            padding-right: 2px;
+            padding: 16px 20px 20px;
+            box-sizing: border-box;
         }
         .bili-cmt-mode-progress .bili-cmt-tabs,
         .bili-cmt-mode-progress .bili-cmt-tab-content,
         .bili-cmt-mode-dashboard .bili-cmt-tabs,
         .bili-cmt-mode-dashboard .bili-cmt-tab-content { display: none !important; }
 
+        /* ========== 顶部标签（B 站下划线式） ========== */
         .bili-cmt-tabs {
             display: flex;
-            background: var(--bce-fill-1);
-            border-radius: 10px;
-            padding: 3px;
-            gap: 4px;
+            gap: 24px;
+            border-bottom: 1px solid var(--bce-line-weak);
+            margin-bottom: -2px;
         }
         .bili-cmt-tab {
-            flex: 1;
-            text-align: center;
-            padding: 8px 12px;
-            font-size: 13px;
-            font-weight: 600;
+            position: relative;
+            padding: 0 0 10px;
+            font-size: 14px;
+            font-weight: 500;
+            line-height: 20px;
+            color: var(--bce-text-2);
             cursor: pointer;
-            border-radius: 8px;
-            color: var(--bce-text-3);
-            transition: all 0.2s;
+            transition: color 0.2s ease;
             user-select: none;
             -webkit-user-select: none;
         }
-        .bili-cmt-tab.active {
-            background: var(--bce-seg-active);
-            color: var(--bce-accent);
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+        .bili-cmt-tab:hover { color: var(--bce-brand); }
+        .bili-cmt-tab.active { color: var(--bce-text-1); font-weight: 600; }
+        .bili-cmt-tab.active::after {
+            content: "";
+            position: absolute;
+            left: 50%;
+            bottom: -1px;
+            transform: translateX(-50%);
+            width: 20px;
+            height: 2px;
+            border-radius: 2px;
+            background: var(--bce-brand);
         }
+        .bili-cmt-tab:focus-visible { outline: 2px solid var(--bce-brand); outline-offset: 2px; border-radius: 2px; }
 
-        .bili-cmt-tab-content {
-            display: none;
-            flex-direction: column;
-            gap: 14px;
-        }
+        .bili-cmt-tab-content { display: none; flex-direction: column; gap: 16px; }
         .bili-cmt-tab-content.active { display: flex; }
 
-        .bili-cmt-form-group {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-        }
-        .bili-cmt-form-group label {
-            font-size: 12px;
-            font-weight: 600;
+        /* ========== 表单 ========== */
+        .bili-cmt-form-group { display: flex; flex-direction: column; gap: 8px; }
+        .bili-cmt-form-group > label {
+            font-size: 13px;
+            font-weight: 500;
+            line-height: 18px;
             color: var(--bce-text-2);
         }
         .bili-cmt-form-group input[type="text"],
         .bili-cmt-form-group input[type="number"] {
-            background: var(--bce-input-bg);
-            border: 1px solid var(--bce-input-line);
-            border-radius: 9px;
-            padding: 9px 12px;
+            background: var(--bce-fill-1);
+            border: 1px solid transparent;
+            border-radius: 8px;
+            padding: 0 12px;
+            height: 36px;
             font-size: 13px;
             outline: none;
-            transition: border-color 0.2s, box-shadow 0.2s;
+            transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
             color: var(--bce-text-1);
             font-family: inherit;
             width: 100%;
             box-sizing: border-box;
         }
+        .bili-cmt-form-group input[type="text"]:hover,
+        .bili-cmt-form-group input[type="number"]:hover { background: var(--bce-fill-2); }
         .bili-cmt-form-group input[type="text"]:focus,
         .bili-cmt-form-group input[type="number"]:focus {
-            border-color: var(--bce-accent);
-            box-shadow: 0 0 0 3px var(--bce-accent-soft);
+            background: var(--bce-surface);
+            border-color: var(--bce-brand);
+            box-shadow: 0 0 0 3px var(--bce-brand-weak);
         }
         .bili-cmt-form-group input::placeholder { color: var(--bce-text-3); opacity: 1; }
-        .bili-cmt-shake { animation: bceShake 0.4s ease; border-color: #f05a5a !important; }
+        /* 去掉数字输入框的上下箭头，保持与 B 站表单一致 */
+        .bili-cmt-form-group input[type="number"]::-webkit-outer-spin-button,
+        .bili-cmt-form-group input[type="number"]::-webkit-inner-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+        .bili-cmt-form-group input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+        .bili-cmt-shake { animation: bceShake 0.4s ease; border-color: var(--bce-red) !important; }
         @keyframes bceShake {
             0%, 100% { transform: translateX(0); }
             25% { transform: translateX(-4px); }
@@ -952,140 +978,156 @@
         }
 
         .bili-cmt-form-row { display: flex; gap: 12px; }
-        .bili-cmt-form-group.half { flex: 1; width: 50%; }
+        .bili-cmt-form-group.half { flex: 1; width: 50%; min-width: 0; }
 
+        /* ========== 分段选择器 ========== */
         .bili-cmt-segmented {
             display: flex;
-            background: var(--bce-fill-1);
-            border-radius: 9px;
+            background: var(--bce-fill-2);
+            border-radius: 8px;
             padding: 3px;
             gap: 2px;
         }
-        .bili-cmt-segment-item { flex: 1; position: relative; cursor: pointer; text-align: center; }
-        .bili-cmt-segment-item input { position: absolute; opacity: 0; cursor: pointer; height: 0; width: 0; }
+        .bili-cmt-segment-item { flex: 1; position: relative; cursor: pointer; text-align: center; min-width: 0; }
+        .bili-cmt-segment-item input { position: absolute; opacity: 0; width: 0; height: 0; }
         .bili-cmt-segment-item span {
             display: block;
-            padding: 7px 10px;
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--bce-text-3);
-            border-radius: 7px;
-            transition: all 0.2s;
+            padding: 7px 8px;
+            font-size: 13px;
+            font-weight: 500;
+            line-height: 18px;
+            color: var(--bce-text-2);
+            border-radius: 6px;
+            transition: background-color 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
             user-select: none;
             -webkit-user-select: none;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
+        .bili-cmt-segment-item span:hover { color: var(--bce-text-1); }
         .bili-cmt-segment-item input:checked + span {
             background: var(--bce-seg-active);
-            color: var(--bce-accent);
-            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+            color: var(--bce-brand);
+            font-weight: 600;
+            box-shadow: var(--bce-shadow-sm);
         }
+        .bili-cmt-segment-item input:focus-visible + span { outline: 2px solid var(--bce-brand); outline-offset: -1px; }
 
+        /* ========== 复选框 ========== */
         .bili-cmt-checkbox-label {
             display: flex;
             align-items: center;
             gap: 8px;
-            font-size: 12px;
-            font-weight: 600;
+            font-size: 13px;
+            font-weight: 500;
+            line-height: 18px;
             color: var(--bce-text-2);
             cursor: pointer;
             user-select: none;
             -webkit-user-select: none;
         }
-        .bili-cmt-checkbox-label input { accent-color: var(--bce-accent); width: 15px; height: 15px; cursor: pointer; }
+        .bili-cmt-checkbox-label:hover { color: var(--bce-text-1); }
+        .bili-cmt-checkbox-label input {
+            accent-color: var(--bce-brand);
+            width: 16px;
+            height: 16px;
+            margin: 0;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
 
+        /* ========== 按钮 ========== */
         .bili-cmt-btn {
             border: none;
-            border-radius: 10px;
-            padding: 11px 20px;
+            border-radius: 8px;
+            height: 40px;
+            padding: 0 20px;
             font-size: 14px;
             font-weight: 600;
+            line-height: 1;
             font-family: inherit;
             cursor: pointer;
-            transition: transform 0.15s ease, box-shadow 0.2s ease, background 0.2s ease, opacity 0.2s ease;
+            transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
             text-align: center;
             outline: none;
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            gap: 7px;
+            gap: 6px;
+            box-sizing: border-box;
         }
-        .bili-cmt-btn:disabled { opacity: 0.55; pointer-events: none; }
+        .bili-cmt-btn:focus-visible { outline: 2px solid var(--bce-blue); outline-offset: 2px; }
+        .bili-cmt-btn:disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
         .bili-cmt-btn.primary {
-            background: linear-gradient(135deg, var(--bce-accent), #ff8aa8);
+            background: var(--bce-brand);
             color: #fff;
-            box-shadow: 0 6px 16px rgba(251, 114, 153, 0.32);
+            width: 100%;
         }
-        .bili-cmt-btn.primary:hover {
-            background: linear-gradient(135deg, var(--bce-accent-strong), #ff9cb4);
-            box-shadow: 0 8px 20px rgba(251, 114, 153, 0.4);
-            transform: translateY(-1px);
-        }
-        .bili-cmt-btn.primary:active { transform: translateY(0) scale(0.98); }
+        .bili-cmt-btn.primary:hover { background: var(--bce-brand-hover); }
+        .bili-cmt-btn.primary:active { background: var(--bce-brand-active); }
+        .bili-cmt-btn svg { width: 16px; height: 16px; flex-shrink: 0; }
         .bili-cmt-btn.danger {
             background: transparent;
-            color: #f05a5a;
-            border: 1px solid rgba(240, 90, 90, 0.4);
+            color: var(--bce-red);
+            border: 1px solid var(--bce-line);
+            width: 100%;
         }
-        .bili-cmt-btn.danger:hover { background: rgba(240, 90, 90, 0.08); }
+        .bili-cmt-btn.danger:hover { background: rgba(244, 91, 91, 0.06); border-color: rgba(244, 91, 91, 0.4); }
         .bili-cmt-btn-text {
             background: transparent;
             border: none;
             color: var(--bce-blue);
-            font-size: 12px;
-            font-weight: 600;
+            font-size: 13px;
+            font-weight: 500;
             font-family: inherit;
             cursor: pointer;
             outline: none;
-            padding: 0;
+            padding: 4px 0;
+            line-height: 18px;
         }
-        .bili-cmt-btn-text:hover { opacity: 0.8; }
+        .bili-cmt-btn-text:hover { color: var(--bce-brand); }
+        .bili-cmt-btn-text:focus-visible { outline: 2px solid var(--bce-blue); outline-offset: 2px; border-radius: 2px; }
 
         /* ========== 进度视图 ========== */
-        .bili-cmt-progress-panel {
-            display: none;
-            flex-direction: column;
-            gap: 12px;
-        }
-        .bili-cmt-progress-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: baseline;
-        }
+        .bili-cmt-progress-panel { display: none; flex-direction: column; gap: 16px; }
+        .bili-cmt-progress-header { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; }
         .bili-cmt-progress-header h4 {
             margin: 0;
-            font-size: 15px;
-            color: var(--bce-accent);
-            font-weight: 700;
-        }
-        #progress-speed {
-            font-size: 11px;
-            color: var(--bce-text-3);
+            font-size: 14px;
             font-weight: 600;
+            line-height: 20px;
+            color: var(--bce-text-1);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         #progress-percent {
-            font-size: 20px;
-            font-weight: 800;
-            color: var(--bce-accent);
+            font-size: 24px;
+            font-weight: 600;
+            line-height: 26px;
+            color: var(--bce-text-1);
             font-variant-numeric: tabular-nums;
+            flex-shrink: 0;
         }
         .bili-cmt-progress-bar-container {
             background: var(--bce-fill-2);
-            height: 8px;
-            border-radius: 10px;
+            height: 6px;
+            border-radius: 999px;
             overflow: hidden;
         }
         .bili-cmt-progress-bar-fill {
-            background: linear-gradient(90deg, var(--bce-accent), var(--bce-blue));
+            background: var(--bce-brand);
             height: 100%;
-            border-radius: 10px;
+            border-radius: 999px;
             width: 0%;
-            transition: width 0.25s ease;
+            transition: width 0.3s ease;
         }
         /* 分母不可靠时的不确定进度：滑动光条，避免显示错误的百分比 */
         .bili-cmt-progress-bar-fill.indeterminate {
             width: 32% !important;
-            background: linear-gradient(90deg, transparent, var(--bce-accent), var(--bce-blue), transparent);
-            animation: bce-progress-slide 1.3s ease-in-out infinite;
+            background: linear-gradient(90deg, transparent, var(--bce-brand), transparent);
+            animation: bce-progress-slide 1.4s ease-in-out infinite;
         }
         @keyframes bce-progress-slide {
             0% { transform: translateX(-110%); }
@@ -1093,175 +1135,261 @@
         }
         .bili-cmt-stats-summary {
             display: flex;
-            gap: 20px;
+            align-items: center;
+            gap: 16px;
             font-size: 12px;
-            font-weight: 600;
+            line-height: 18px;
             color: var(--bce-text-2);
         }
         .bili-cmt-badge {
-            background: var(--bce-accent-soft);
-            color: var(--bce-accent);
-            padding: 2px 8px;
-            border-radius: 20px;
-            font-weight: 700;
+            display: inline-block;
+            min-width: 22px;
+            padding: 1px 8px;
+            border-radius: 999px;
+            background: var(--bce-brand-weak);
+            color: var(--bce-brand);
+            font-size: 12px;
+            font-weight: 600;
+            font-variant-numeric: tabular-nums;
+            text-align: center;
         }
+        #progress-speed { margin-left: auto; color: var(--bce-text-3); }
+
         .bili-cmt-console {
-            background: var(--bce-console-bg);
-            border: 1px solid var(--bce-line);
-            border-radius: 10px;
+            background: var(--bce-fill-1);
+            border-radius: 8px;
             padding: 12px;
             font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
-            font-size: 11px;
+            font-size: 12px;
+            line-height: 1.6;
             flex-grow: 1;
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            gap: 6px;
+            gap: 2px;
             text-align: left;
             min-height: 180px;
             max-height: 240px;
             box-sizing: border-box;
+            color: var(--bce-text-2);
         }
-        .log-line { word-break: break-all; line-height: 1.4; }
+        .log-line { word-break: break-word; }
         .log-line.info { color: var(--bce-text-2); }
-        .log-line.success { color: #2ecc71; font-weight: 600; }
-        .log-line.error { color: #e74c3c; font-weight: 600; }
-        .log-line.warn { color: #f39c12; }
+        .log-line.success { color: var(--bce-green); }
+        .log-line.error { color: var(--bce-red); }
+        .log-line.warn { color: var(--bce-orange); }
 
         /* ========== 数据看板 ========== */
-        .bili-cmt-dashboard { display: none; flex-direction: column; gap: 14px; }
-        .dashboard-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+        .bili-cmt-dashboard { display: none; flex-direction: column; gap: 16px; }
+        .dashboard-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+        .dashboard-header h4 {
+            margin: 0;
+            font-size: 14px;
+            font-weight: 600;
+            line-height: 20px;
+            color: var(--bce-text-1);
         }
-        .dashboard-header h4 { margin: 0; font-size: 15px; color: var(--bce-accent); font-weight: 700; }
-        .dashboard-summary-cards { display: flex; gap: 10px; }
+        .dash-duration {
+            font-size: 12px;
+            line-height: 18px;
+            color: var(--bce-text-2);
+            padding: 10px 12px;
+            background: var(--bce-fill-1);
+            border-radius: 8px;
+        }
+        .dash-duration span { color: var(--bce-brand); font-weight: 600; }
+        .dashboard-summary-cards { display: flex; gap: 8px; }
         .summary-card {
             flex: 1;
-            background: var(--bce-card);
+            min-width: 0;
+            background: var(--bce-surface);
             border: 1px solid var(--bce-line);
-            border-radius: 12px;
-            padding: 12px 6px;
+            border-radius: 8px;
+            padding: 12px 8px;
             display: flex;
             flex-direction: column;
             align-items: center;
-            gap: 4px;
+            gap: 2px;
         }
-        .card-num { font-size: 18px; font-weight: 800; color: var(--bce-accent); font-variant-numeric: tabular-nums; }
-        .card-label { font-size: 9px; color: var(--bce-text-3); font-weight: 600; text-align: center; }
+        .summary-card:first-child { border-color: var(--bce-brand-weak); background: var(--bce-brand-weak); }
+        .card-num {
+            font-size: 20px;
+            font-weight: 600;
+            line-height: 24px;
+            color: var(--bce-text-1);
+            font-variant-numeric: tabular-nums;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .summary-card:first-child .card-num { color: var(--bce-brand); }
+        .card-label { font-size: 12px; line-height: 16px; color: var(--bce-text-3); }
+
         .dashboard-charts { display: flex; flex-direction: column; gap: 12px; }
         .chart-section {
-            background: var(--bce-card);
+            background: var(--bce-surface);
             border: 1px solid var(--bce-line);
-            border-radius: 12px;
-            padding: 12px;
+            border-radius: 8px;
+            padding: 12px 14px 14px;
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 12px;
         }
         .chart-section h5 {
             margin: 0;
-            font-size: 11px;
-            font-weight: 700;
-            color: var(--bce-text-2);
+            font-size: 13px;
+            font-weight: 600;
+            line-height: 18px;
+            color: var(--bce-text-1);
             text-align: left;
         }
-        .chart-container { display: flex; flex-direction: column; gap: 8px; }
-        .chart-bar-row { display: flex; align-items: center; gap: 10px; font-size: 11px; }
+        .chart-container { display: flex; flex-direction: column; gap: 10px; }
+        .chart-empty {
+            font-size: 12px;
+            line-height: 18px;
+            color: var(--bce-text-3);
+            text-align: center;
+            padding: 14px 0;
+        }
+        .chart-bar-row { display: flex; align-items: center; gap: 10px; font-size: 12px; line-height: 16px; }
         .chart-bar-label {
-            width: 55px;
+            width: 52px;
+            flex-shrink: 0;
             text-overflow: ellipsis;
             overflow: hidden;
             white-space: nowrap;
             text-align: left;
-            font-weight: 600;
-            color: var(--bce-text-1);
+            color: var(--bce-text-2);
         }
         .chart-bar-bg {
             flex-grow: 1;
-            background: var(--bce-fill-1);
-            height: 12px;
-            border-radius: 6px;
+            background: var(--bce-fill-2);
+            height: 8px;
+            border-radius: 999px;
             overflow: hidden;
             position: relative;
         }
         .chart-bar-fill {
-            background: linear-gradient(90deg, var(--bce-accent), #ff9eb6);
+            background: var(--bce-brand);
             height: 100%;
-            border-radius: 6px;
+            border-radius: 999px;
             width: 0%;
             transition: width 0.5s ease-out;
         }
-        .chart-bar-val { width: 80px; text-align: right; font-weight: 700; color: var(--bce-text-2); }
-        .chart-section-row { display: flex; gap: 10px; }
-        .chart-section-row .chart-section.half { flex: 1; width: 50%; }
-        .level-stats-container { display: flex; flex-direction: column; gap: 5px; width: 100%; }
-        .level-row { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+        .chart-bar-val {
+            width: 76px;
+            flex-shrink: 0;
+            text-align: right;
+            color: var(--bce-text-3);
+            font-variant-numeric: tabular-nums;
+        }
+        .chart-section-row { display: flex; gap: 12px; align-items: stretch; }
+        .chart-section-row .chart-section.half {
+            flex: 1;
+            width: 50%;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+        }
+        /* 半宽卡片高度由最高的那张决定，内容少的（性别）需要垂直居中 */
+        .chart-section-row .chart-section.half .chart-container {
+            flex: 1;
+            justify-content: center;
+        }
+
+        .level-stats-container { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+        .level-row { display: flex; align-items: center; gap: 8px; font-size: 11px; line-height: 14px; }
         .level-label {
-            width: 32px;
-            font-size: 9px;
-            font-weight: 700;
-            padding: 2px 4px;
+            width: 28px;
+            flex-shrink: 0;
+            font-size: 10px;
+            font-weight: 600;
+            padding: 1px 0;
             border-radius: 4px;
             text-align: center;
             color: #fff;
+            font-family: Helvetica, Arial, sans-serif;
         }
-        .level-label.lv1 { background: #95ddb2; }
-        .level-label.lv2 { background: #92d1e5; }
-        .level-label.lv3 { background: #ffb37c; }
-        .level-label.lv4 { background: #ff8e29; }
-        .level-label.lv5 { background: #ee6363; }
-        .level-label.lv6 { background: #ff0000; }
+        .level-label.lv1 { background: #c9ccd0; }
+        .level-label.lv2 { background: #8fd9ae; }
+        .level-label.lv3 { background: #5cc4ef; }
+        .level-label.lv4 { background: #ffab4d; }
+        .level-label.lv5 { background: #ff8a5c; }
+        .level-label.lv6 { background: #fb7299; }
         .level-bar-bg {
             flex-grow: 1;
-            background: var(--bce-fill-1);
-            height: 8px;
-            border-radius: 4px;
+            background: var(--bce-fill-2);
+            height: 6px;
+            border-radius: 999px;
             overflow: hidden;
+            min-width: 0;
         }
-        .level-bar-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease-out; }
-        .level-bar-fill.lv1 { background: #95ddb2; }
-        .level-bar-fill.lv2 { background: #92d1e5; }
-        .level-bar-fill.lv3 { background: #ffb37c; }
-        .level-bar-fill.lv4 { background: #ff8e29; }
-        .level-bar-fill.lv5 { background: #ee6363; }
-        .level-bar-fill.lv6 { background: #ff0000; }
-        .level-val { width: 58px; text-align: right; font-weight: 700; color: var(--bce-text-2); white-space: nowrap; }
+        .level-bar-fill { height: 100%; border-radius: 999px; transition: width 0.5s ease-out; }
+        .level-bar-fill.lv1 { background: #c9ccd0; }
+        .level-bar-fill.lv2 { background: #8fd9ae; }
+        .level-bar-fill.lv3 { background: #5cc4ef; }
+        .level-bar-fill.lv4 { background: #ffab4d; }
+        .level-bar-fill.lv5 { background: #ff8a5c; }
+        .level-bar-fill.lv6 { background: #fb7299; }
+        .level-val {
+            width: 62px;
+            flex-shrink: 0;
+            text-align: right;
+            color: var(--bce-text-3);
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+
         .gender-stats-container {
             display: flex;
-            justify-content: space-around;
+            justify-content: space-between;
             align-items: center;
-            height: 100%;
-            padding: 8px 0;
+            gap: 6px;
             width: 100%;
         }
         .gender-item {
+            flex: 1;
+            min-width: 0;
             display: flex;
             flex-direction: column;
             align-items: center;
-            gap: 4px;
+            gap: 2px;
             font-size: 11px;
-            font-weight: 600;
+            line-height: 14px;
         }
-        .gender-item.male { color: var(--bce-blue); }
-        .gender-item.female { color: var(--bce-accent); }
-        .gender-item.secret { color: var(--bce-text-3); }
-        .gender-item .g-svg { stroke: currentColor; display: block; }
-        .gender-item .g-label { font-size: 11px; font-weight: 700; }
-        .gender-item .g-pct { font-size: 13px; font-weight: 800; }
-        .gender-item .g-count { font-size: 9px; color: var(--bce-text-3); }
-        .dash-duration {
-            font-size: 12px;
-            color: var(--bce-text-2);
-            font-weight: 600;
-            text-align: center;
-            padding: 8px 10px;
-            background: var(--bce-accent-soft);
-            border-radius: 10px;
+        .g-icon {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 2px;
         }
-        .dash-duration span { color: var(--bce-accent); font-weight: 800; }
+        .gender-item.male .g-icon { background: rgba(0, 174, 236, 0.1); color: var(--bce-blue); }
+        .gender-item.female .g-icon { background: var(--bce-brand-weak); color: var(--bce-brand); }
+        .gender-item.secret .g-icon { background: var(--bce-fill-2); color: var(--bce-text-3); }
+        .gender-item .g-svg { stroke: currentColor; display: block; width: 16px; height: 16px; }
+        .gender-item .g-label { color: var(--bce-text-3); }
+        .gender-item .g-pct {
+            font-size: 14px;
+            font-weight: 600;
+            line-height: 18px;
+            color: var(--bce-text-1);
+            font-variant-numeric: tabular-nums;
+        }
+        .gender-item .g-count { font-size: 11px; color: var(--bce-text-3); font-variant-numeric: tabular-nums; }
         .dashboard-footer { margin-top: 2px; }
+
+        /* ========== 降低动效偏好 ========== */
+        @media (prefers-reduced-motion: reduce) {
+            .bili-cmt-panel,
+            .bili-cmt-toast,
+            .bili-cmt-progress-bar-fill,
+            .chart-bar-fill,
+            .level-bar-fill { transition: none !important; animation: none !important; }
+            .bili-cmt-progress-bar-fill.indeterminate { width: 100% !important; opacity: 0.5; }
+        }
     `;
 
     // ==========================================
@@ -1987,12 +2115,15 @@
         document.getElementById('dash-main').innerText = stats.main;
         document.getElementById('dash-sub').innerText = stats.sub;
 
+        const dashTitle = document.getElementById('dash-title');
+        if (dashTitle) dashTitle.innerText = incomplete ? '导出已中断 · 数据统计' : '导出完成 · 数据统计';
+
         // Show export duration
         const durationRow = document.getElementById('dash-duration-row');
         if (durationRow && exportStartTime > 0) {
             const elapsed = Date.now() - exportStartTime;
-            const prefix = incomplete ? '⚠️ 导出已中断' : '✅ 导出完成';
-            durationRow.innerHTML = `${prefix}，耗时 <span>${formatDuration(elapsed)}</span>，共 ${total} 条评论`;
+            const prefix = incomplete ? '已中断，' : '';
+            durationRow.innerHTML = `${prefix}耗时 <span>${formatDuration(elapsed)}</span> · 共 ${total} 条评论`;
             durationRow.style.display = 'block';
         }
 
@@ -2013,7 +2144,7 @@
         const maxCount = topIps.length > 0 ? topIps[0].count : 1;
 
         if (topIps.length === 0) {
-            ipContainer.innerHTML = '<div style="font-size:12px;color:var(--bce-text-2);text-align:center;padding:10px 0;">无 IP 地理位置数据（未登录时不返回该字段）</div>';
+            ipContainer.innerHTML = '<div class="chart-empty">暂无 IP 属地数据<br>（需登录 B 站后才会返回该字段）</div>';
         } else {
             topIps.forEach(item => {
                 const pct = Math.round((item.count / total) * 100);
@@ -2070,26 +2201,19 @@
         const fPct = total > 0 ? Math.round((f / total) * 100) : 0;
         const sPct = total > 0 ? Math.round((s / total) * 100) : 0;
 
+        const genderIcon = (kind, svg) => `
+                <div class="gender-item ${kind}">
+                    <span class="g-icon">${svg}</span>
+                    <span class="g-label">${kind === 'male' ? '男' : kind === 'female' ? '女' : '保密'}</span>
+                    <span class="g-pct">${kind === 'male' ? mPct : kind === 'female' ? fPct : sPct}%</span>
+                    <span class="g-count">${kind === 'male' ? m : kind === 'female' ? f : s}</span>
+                </div>`;
+
         sexContainer.innerHTML = `
             <div class="gender-stats-container">
-                <div class="gender-item male">
-                    <svg class="g-svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="14" r="5"></circle><line x1="19" y1="5" x2="13.6" y2="10.4"></line><polyline points="14 5 19 5 19 10"></polyline></svg>
-                    <span class="g-label">男</span>
-                    <span class="g-pct">${mPct}%</span>
-                    <span class="g-count">(${m})</span>
-                </div>
-                <div class="gender-item female">
-                    <svg class="g-svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="9" r="5"></circle><line x1="12" y1="14" x2="12" y2="21"></line><line x1="9" y1="18" x2="15" y2="18"></line></svg>
-                    <span class="g-label">女</span>
-                    <span class="g-pct">${fPct}%</span>
-                    <span class="g-count">(${f})</span>
-                </div>
-                <div class="gender-item secret">
-                    <svg class="g-svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
-                    <span class="g-label">保密</span>
-                    <span class="g-pct">${sPct}%</span>
-                    <span class="g-count">(${s})</span>
-                </div>
+                ${genderIcon('male', '<svg class="g-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="14" r="5"></circle><line x1="19" y1="5" x2="13.6" y2="10.4"></line><polyline points="14 5 19 5 19 10"></polyline></svg>')}
+                ${genderIcon('female', '<svg class="g-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="9" r="5"></circle><line x1="12" y1="14" x2="12" y2="21"></line><line x1="9" y1="18" x2="15" y2="18"></line></svg>')}
+                ${genderIcon('secret', '<svg class="g-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>')}
             </div>
         `;
     }
@@ -2097,7 +2221,7 @@
     // ==========================================
     // 10. UI Generation & Control
     // ==========================================
-    const SCRIPT_VERSION = '0.4.1';
+    const SCRIPT_VERSION = '0.5.0';
     const ENTRY_BTN_ID = 'bili-cmt-entry';
     const SETTINGS_KEY = 'biliCmtExporter.settings.v1';
 
@@ -2414,7 +2538,7 @@
             <div class="bili-cmt-header">
                 <div class="bili-cmt-title-area">
                     <h3>评论区导出</h3>
-                    <span class="bili-cmt-subtitle">bilibili-comment-exporter v${SCRIPT_VERSION}</span>
+                    <span class="bili-cmt-subtitle">v${SCRIPT_VERSION} · 评论数据导出</span>
                 </div>
                 <button id="bili-cmt-close-btn" class="bili-cmt-icon-btn" aria-label="关闭面板">
                     ${CLOSE_ICON_SVG}
@@ -2528,14 +2652,14 @@
                         <div id="progress-speed">进度: 0 / 0</div>
                     </div>
                     <div id="console-log" class="bili-cmt-console">
-                        <div class="log-line info">[INFO] 准备就绪，等待开始。</div>
+                        <div class="log-line info">等待开始导出…</div>
                     </div>
                     <button id="progress-cancel-btn" class="bili-cmt-btn danger">取消导出</button>
                 </div>
 
                 <div id="bili-cmt-dashboard" class="bili-cmt-dashboard">
                     <div class="dashboard-header">
-                        <h4>导出完成 · 数据统计</h4>
+                        <h4 id="dash-title">导出完成 · 数据统计</h4>
                         <button id="dashboard-back-btn" class="bili-cmt-btn-text">返回设置</button>
                     </div>
                     <div id="dash-duration-row" class="dash-duration" style="display:none;"></div>
