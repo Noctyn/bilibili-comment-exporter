@@ -1,35 +1,30 @@
-# Bilibili Comment Exporter (bilibili-comment-exporter)
+# Bilibili Comment Exporter
 
-一款运行于浏览器环境的哔哩哔哩（B站）视频评论区导出油猴脚本（Tampermonkey UserScript）。该工具完全移植并适配了由 [WShihan](https://github.com/WShihan) 编写的基于 Go 语言的命令行评论下载工具 [blblcd](https://github.com/WShihan/blblcd) 的核心功能，并在此之上提供了极具现代视觉美感的控制面板及数据统计图表。
+B 站视频评论区的导出工具，做成油猴脚本跑在浏览器里。点开视频或 UP 主空间页的「导出评论」，把主评论和楼中楼抓下来存成 CSV。
 
 [![GitHub Repo stars](https://img.shields.io/github/stars/heroxv/bilibili-comment-exporter?style=plastic) ![GitHub repo size](https://img.shields.io/github/repo-size/heroxv/bilibili-comment-exporter?style=plastic) ![GitHub last commit](https://img.shields.io/github/last-commit/heroxv/bilibili-comment-exporter?style=plastic) ![GitHub](https://img.shields.io/github/license/heroxv/bilibili-comment-exporter?style=plastic) ![GitHub top language](https://img.shields.io/github/languages/top/heroxv/bilibili-comment-exporter?style=plastic)](https://github.com/heroxv/bilibili-comment-exporter)
 
 ---
 
-### 🔗 关联项目：blblcd (Go 语言命令行下载工具)
+## 和 blblcd 的关系
 
-本项目移植自下述项目的核心 API 与 CSV 数据结构定义：
+[blblcd](https://github.com/WShihan/blblcd) 是 [WShihan](https://github.com/WShihan) 用 Go 写的命令行评论下载工具，基于 [bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect)，跨 Mac / Linux / Windows。脚本的接口调用方式和 CSV 字段都沿用它，两边导出的数据可以对照着看。
 
-*   **blblcd (Bilibili Comment Downloader)**：一款基于 [bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect) 的B站视频评论下载命令行工具。
-*   🗂️ 仓库： [Codeberg](https://codeberg.org/wsh233/blblcd) | [GitHub](https://github.com/WShihan/blblcd)
-*   🎉 支持跨平台（Mac/Linux/Windows），可高效、快速地在终端下载并进行各种本地映射与统计。
+仓库：[Codeberg](https://codeberg.org/wsh233/blblcd) | [GitHub](https://github.com/WShihan/blblcd)
 
-## 🌟 项目特点
+## 功能
 
-*   **全数据抓取**：支持导出视频下所有的主评论，以及评论下的楼中楼（子评论）。
-*   **原生入口集成**：无悬浮按钮打扰，导出入口直接嵌入视频操作栏（点赞/投币/收藏/分享旁）与 UP 主空间页操作区，自动适配页面明暗主题。
-*   **Wbi 鉴权签名**：脚本内建 Wbi 接口签名机制，自动获取 img_key 和 sub_key 完成签名，避免 API 请求返回 -403 受限。
-*   **批量导出**：支持在 UP 主个人空间页（`space.bilibili.com`）一键批量抓取该 UP 主的投稿视频评论。
-*   **Excel 兼容**：导出的 CSV 文件默认添加 UTF-8 BOM 编码头，彻底杜绝使用 Microsoft Excel/WPS 打开中文评论时出现的乱码问题。
-*   **实时数据看板**：完成导出后，在页面内直接渲染可视化的数据分析统计：
-    *   📍 **IP 属地分布** (Top 5 柱状图)
-    *   📈 **用户等级分布** (LV1 - LV6 比例)
-    *   👫 **用户性别比例** (男/女/保密 百分比)
-*   **对齐 B 站原生界面**：沿用 B 站设计规范——品牌粉 `#FB7299`、扁平白卡、1px 细边框、12px 圆角、下划线式标签页，文字层级与 B 站一致；自动跟随 B 站明暗主题换装，并记忆上次的导出配置。
+* 主评论、楼中楼（子评论）都能抓。
+* 入口直接嵌在视频操作栏和 UP 主空间页的操作区，不是悬浮球；跟着页面明暗主题走。
+* 接口要 Wbi 签名，脚本自己取 `img_key` / `sub_key` 算，避免 -403。
+* 在 UP 主空间页可以按页批量抓他的投稿，最后合成一个 CSV。
+* CSV 带 UTF-8 BOM，Excel / WPS 打开中文不乱码。
+* 导出完成后面板里出一份统计：IP 属地 Top 5、LV1–LV6 等级分布、性别构成（男 / 女 / 保密）。
+* 界面按 B 站的设计规范来：品牌粉 `#FB7299`、白卡、1px 细边框、12px 圆角、下划线式标签页，明暗主题自动跟随，上次的导出配置也会记住。
 
 ---
 
-## 🎨 界面效果预览
+## 界面
 
 | 视频工具栏入口 | 空间页入口 |
 | :---: | :---: |
@@ -38,9 +33,10 @@
 | 控制面板 | 导出进度 | 数据看板 |
 | :---: | :---: | :---: |
 | ![控制面板](https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/assets/%E6%8E%A7%E5%88%B6%E9%9D%A2%E6%9D%BF.png) | ![导出进度](https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/assets/%E5%AF%BC%E5%87%BA%E8%BF%9B%E5%BA%A6.png) | ![数据看板](https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/assets/%E6%95%B0%E6%8D%AE%E7%9C%8B%E6%9D%BF.png) |
+
 ---
 
-## 📂 项目结构
+## 项目结构
 
 ```text
 bilibili-comment-exporter/
@@ -64,57 +60,58 @@ bilibili-comment-exporter/
 
 ---
 
-## 🧪 开发与测试
+## 开发与测试
 
-脚本本身是零依赖的单文件用户脚本，不需要构建。仓库内的 `package.json` 只用于跑离线测试：
+脚本是单文件、零依赖，不用构建。`package.json` 只是为了跑测试：
 
 ```bash
 npm test          # 等价于 node --test "test/*.test.js"
 ```
 
-测试不联网：`test/harness.mjs` 会把脚本尾部的 `init()` 调用替换成内部函数导出，并提供最小的 `document` / `localStorage` / `fetch` 桩，因此可以直接断言签名算法、错误分类、并发与取消行为。修改脚本尾部结构时若装载失败，测试会给出明确报错。
+测试不联网。`test/harness.mjs` 把脚本末尾的 `init()` 换成一段内部函数导出，再配一套最小的 `document` / `localStorage` / `fetch` 桩，所以签名算法、错误分类、并发和取消这些都能直接断言。要是改了脚本尾部的结构，装载会失败并报错。
 
 ---
 
-## 🚀 安装指南
+## 安装
 
-### 1. 准备工作
-确保您的浏览器已安装了用户脚本管理器插件：
-*   [Tampermonkey (油猴)](https://www.tampermonkey.net/) (强烈推荐)
-*   [Violentmonkey (暴力猴)](https://violentmonkey.github.io/)
+先装一个用户脚本管理器：[Tampermonkey](https://www.tampermonkey.net/)（推荐）或 [Violentmonkey](https://violentmonkey.github.io/)。
 
-### 2. 安装脚本
-*   👉 **[从 Greasy Fork 安装](https://greasyfork.org/zh-CN/scripts/582735)**（推荐）
-*   👉 **[从 GitHub 直接安装](https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js)**
----
+然后二选一：
 
-## 🛠️ 使用说明
-
-### 视频评论导出
-1.  打开任意 B站视频播放页面（例如：`https://www.bilibili.com/video/BV...`）。
-2.  视频下方的操作栏（点赞 / 投币 / 收藏 / 分享 附近）会出现 **"导出评论"** 按钮，点击即可展开控制面板。
-3.  脚本会自动提取并填入当前视频的 BVID。
-4.  在面板中按需配置：
-    *   **排序方式**：按热度优先或最新时间优先。
-    *   **楼中楼**：是否抓取子评论。
-    *   **数量限制**：设置最大抓取主评论数量（留空表示抓取全部）。
-    *   **请求延迟**：默认 500 毫秒，调大可以降低触发防爬策略的风险。
-5.  点击 **"开始导出"**。导出过程中可在控制台区域实时查看进度和日志。
-6.  抓取完成后，浏览器会自动触发 CSV 文件下载，并展示数据统计看板。
-
-### UP 主视频批量导出
-1.  进入任意 B站 UP 主的空间首页（例如：`https://space.bilibili.com/...`）。
-2.  点击 UP 主昵称旁操作区的 **"导出评论"** 按钮，面板会自动切到 **"UP主批量"** 选项卡并填入该 UP 主的 Mid。
-3.  配置批量抓取的视频页数（默认 3 页，每页包含 30 个视频）以及其他过滤条件。
-4.  点击 **"开始批量导出"**，脚本将依次迭代视频下载评论，并最终合并为一个 CSV 文件保存。
-
-> 💡 面板支持拖拽标题栏移动位置，按 `Esc` 快速关闭；导出配置（排序、楼中楼、延迟等）会自动记忆，下次打开无需重新设置。
+* [从 Greasy Fork 安装](https://greasyfork.org/zh-CN/scripts/582735)
+* [从 GitHub 直接安装](https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js)
 
 ---
 
-## 📊 导出字段说明
+## 使用
 
-导出的 CSV 文件字段与命令行版 `blblcd` 保持一致：
+### 视频评论
+
+1. 打开任意视频页（`https://www.bilibili.com/video/BV...`）。
+2. 视频下方的操作栏（点赞、投币、收藏、分享旁边）会多出一个「导出评论」，点它展开面板。
+3. 面板会填好当前视频的 BVID。
+4. 面板里能改这几项：
+    * 排序方式：热度优先 / 时间优先
+    * 要不要抓楼中楼
+    * 最多抓多少条主评论（留空是不限）
+    * 请求间隔（默认 500 毫秒，调大能降低触发防爬的风险）
+5. 点「开始导出」，进度和日志在面板里实时滚。
+6. 抓完自动下载 CSV，接着展示统计看板。
+
+### UP 主批量
+
+1. 打开任意 UP 主的空间首页（`https://space.bilibili.com/...`）。
+2. 点昵称旁操作区的「导出评论」，面板会切到「UP主批量」并填好 Mid。
+3. 设置抓几页投稿（默认 3 页，每页 30 个视频），以及其它过滤条件。
+4. 点「开始批量导出」，脚本一个视频一个视频地抓，最后合成一个 CSV。
+
+> 面板可以拖标题栏挪位置，`Esc` 关闭。排序方式、楼中楼开关、延迟这些会记住，下次打开不用重设。
+
+---
+
+## 导出字段
+
+CSV 字段和命令行版 `blblcd` 一致：
 
 | 字段名称 | 说明 | 示例 |
 | :--- | :--- | :--- |
@@ -135,7 +132,7 @@ npm test          # 等价于 node --test "test/*.test.js"
 
 ---
 
-## ⚖️ 免责声明
+## 免责声明
 
 1.  本项目代码仅供个人学习、研究和交流使用，请勿用于商业及非法用途。
 2.  在使用本工具时，请遵守哔哩哔哩（Bilibili）相关用户协议及法律法规，因滥用工具导致账号被封禁或由此产生的其他后果由使用者自行承担。
