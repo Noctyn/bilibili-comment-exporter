@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/bilibili-comment-exporter/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
-// @version      0.4.0
+// @version      0.4.1
 // @description  一款基于 Bilibili API 的视频评论区导出工具，入口集成在视频工具栏与 UP 主空间页中，支持导出主评论和楼中楼为 CSV（UTF-8 BOM 防乱码），并带有实时 IP 属地、等级及性别数据统计看板。
 // @author       heroxv
 // @license      MIT
@@ -357,6 +357,56 @@
         return base + Math.floor(Math.random() * 300);
     }
 
+    // ==========================================
+    // 3.55 Global Rate Limiter
+    // 并发抓取时只靠「每个循环里 sleep」无法约束全局 QPS，
+    // 这里用令牌桶统一排队：所有 API 请求共享一个最小间隔。
+    // ==========================================
+    const rateLimiter = (() => {
+        let minInterval = 0;
+        let nextAt = 0;
+        return {
+            setInterval(ms) {
+                minInterval = Math.max(0, ms || 0);
+                nextAt = 0;
+            },
+            /** 同步占位、异步等待：JS 单线程保证占位是原子的 */
+            async acquire(signal = null) {
+                if (minInterval <= 0) return;
+                const now = Date.now();
+                const wait = Math.max(0, nextAt - now);
+                nextAt = Math.max(now, nextAt) + minInterval;
+                if (wait > 0) await sleep(wait, signal);
+            }
+        };
+    })();
+
+    /**
+     * 限制并发的 map：最多 limit 个 worker 同时消费 items。
+     * worker 通常直接写回自己的 item，调用方随后按 items 原顺序使用，从而保证输出顺序稳定。
+     * worker 内部需自行处理业务错误，只有取消等致命异常才会向上抛。
+     */
+    async function mapWithConcurrency(items, limit, worker, signal = null) {
+        if (items.length === 0) return;
+        const size = Math.max(1, Math.min(limit, items.length));
+        let cursor = 0;
+        const runners = [];
+        for (let i = 0; i < size; i++) {
+            runners.push((async () => {
+                while (true) {
+                    if (signal && signal.aborted) return;
+                    const index = cursor++;
+                    if (index >= items.length) return;
+                    await worker(items[index], index);
+                }
+            })());
+        }
+        // 用 allSettled 收口，避免某个 worker 抛错时其余 worker 的拒绝变成 unhandled rejection
+        const outcomes = await Promise.allSettled(runners);
+        const failed = outcomes.find(o => o.status === 'rejected');
+        if (failed) throw failed.reason;
+    }
+
     /**
      * 仅对「明确可重试」的错误做退避重试；参数错误 / 风控 / 用户取消一律立即失败。
      */
@@ -501,6 +551,8 @@
                 url = `${API_BASE}${path}?${new URLSearchParams(params).toString()}`;
             }
 
+            // 全局限速：并发抓取时由令牌桶统一保证最小请求间隔
+            await rateLimiter.acquire(signal);
             const response = await fetchWithTimeout(url, { credentials: 'include' }, FETCH_TIMEOUT_MS, signal);
 
             // 412 = 风控拦截，继续重试只会加深风控分，直接失败让调用方停止
@@ -1230,14 +1282,16 @@
         return `"${str}"`;
     }
 
-    function downloadCSV(comments, filename) {
-        if (comments.length === 0) {
-            toast('没有可导出的评论数据', 'error');
-            return;
-        }
+    const CSV_HEADERS = ["bvid", "upname", "sex", "content", "pictures", "rpid", "oid", "mid", "parent", "fans_grade", "ctime", "like", "level", "location"];
 
-        const headers = ["bvid", "upname", "sex", "content", "pictures", "rpid", "oid", "mid", "parent", "fans_grade", "ctime", "like", "level", "location"];
-        const csvLines = [headers.join(',')];
+    /**
+     * 分块构建 Blob：评论数上万时，先把所有行拼成一个超大字符串会造成 3-4 倍内存峰值，
+     * 这里改成按 CSV_CHUNK_ROWS 分块，交给 Blob 自己管理（浏览器可落盘）。
+     */
+    function buildCSVBlob(comments) {
+        // UTF-8 BOM 解决 Excel/WPS 打开中文乱码
+        const parts = ['\uFEFF' + CSV_HEADERS.join(',') + '\r\n'];
+        let chunk = [];
 
         for (const cmt of comments) {
             const row = [
@@ -1256,13 +1310,26 @@
                 cmt.level,
                 cmt.location
             ];
-            csvLines.push(row.map(val => escapeCSVField(val)).join(','));
+            chunk.push(row.map(escapeCSVField).join(','));
+            if (chunk.length >= CSV_CHUNK_ROWS) {
+                parts.push(chunk.join('\r\n') + '\r\n');
+                chunk = [];
+            }
+        }
+        if (chunk.length > 0) {
+            parts.push(chunk.join('\r\n') + '\r\n');
         }
 
-        const csvContent = csvLines.join('\r\n') + '\r\n';
+        return new Blob(parts, { type: 'text/csv;charset=utf-8;' });
+    }
 
-        // Add UTF-8 BOM to solve Excel encoding issues (中文乱码)
-        const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+    function downloadCSV(comments, filename) {
+        if (comments.length === 0) {
+            toast('没有可导出的评论数据', 'error');
+            return;
+        }
+
+        const blob = buildCSVBlob(comments);
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.setAttribute("href", url);
@@ -1417,6 +1484,9 @@
     let shouldCancel = false;
     let exportStartTime = 0;
     const LOG_MAX_LINES = 200;
+    const LOG_FLUSH_MS = 120;          // 日志合批刷新间隔
+    const SUB_FETCH_CONCURRENCY = 3;    // 楼中楼并发的楼层数（实际 QPS 仍由令牌桶控制）
+    const CSV_CHUNK_ROWS = 2000;        // CSV 分块大小，避免一次性拼出超大字符串
 
     let currentExportedComments = [];
     let currentFilename = "";
@@ -1456,19 +1526,47 @@
         }
     }
 
-    function log(msg, type = 'info') {
-        const consoleDiv = document.getElementById('console-log');
-        if (!consoleDiv) return;
+    // 日志合批：抓取高峰期可能每秒几十条，逐条改动 DOM 会触发大量重排
+    let logBuffer = [];
+    let logFlushTimer = null;
 
-        const line = document.createElement('div');
-        line.className = `log-line ${type}`;
+    function log(msg, type = 'info') {
         const timeStr = new Date().toTimeString().split(' ')[0];
-        line.innerText = `[${timeStr}] ${msg}`;
-        consoleDiv.appendChild(line);
-        while (consoleDiv.children.length > LOG_MAX_LINES) {
-            consoleDiv.removeChild(consoleDiv.firstChild);
+        logBuffer.push({ text: `[${timeStr}] ${msg}`, type });
+        if (logFlushTimer) return;
+        logFlushTimer = setTimeout(flushLogBuffer, LOG_FLUSH_MS);
+    }
+
+    function flushLogBuffer() {
+        logFlushTimer = null;
+        if (logBuffer.length === 0) return;
+        const pending = logBuffer;
+        logBuffer = [];
+
+        const consoleDiv = document.getElementById('console-log');
+        if (!consoleDiv) return;   // 面板已关闭，丢弃这批日志
+
+        try {
+            // 用户正往上翻看历史日志时不要强制拉到底部
+            const clientHeight = consoleDiv.clientHeight || 0;
+            const nearBottom = (consoleDiv.scrollHeight - consoleDiv.scrollTop - clientHeight) < 40;
+
+            const frag = document.createDocumentFragment();
+            for (const item of pending) {
+                const line = document.createElement('div');
+                line.className = `log-line ${item.type}`;
+                line.innerText = item.text;
+                frag.appendChild(line);
+            }
+            consoleDiv.appendChild(frag);
+
+            while (consoleDiv.children.length > LOG_MAX_LINES) {
+                consoleDiv.removeChild(consoleDiv.firstChild);
+            }
+            if (nearBottom) consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        } catch (e) {
+            // 页面切换导致节点失效时忽略，日志问题不应影响导出
         }
-        consoleDiv.scrollTop = consoleDiv.scrollHeight;
     }
 
     // 错误码语义映射（依据 bilibili-API-collect 文档 comment/list.md 与 misc/sign/wbi.md）
@@ -1561,7 +1659,7 @@
         if (el) el.innerText = text;
     }
 
-    async function exportVideoComments(oid, bvid, mode, includeSub, limit, requestDelay, options = {}) {
+    async function exportVideoComments(oid, bvid, mode, includeSub, limit, options = {}) {
         const signal = options.signal || null;
         const allComments = [];
         const rpidMap = new Set();     // rpid 本身是数字，用 Set<number> 省掉每条两次字符串转换
@@ -1569,6 +1667,55 @@
         const failedFloors = [];       // 子评论未完整抓取的楼层 rpid
 
         const cancelled = () => shouldCancel || !!(signal && signal.aborted);
+
+        /**
+         * 抓取单个楼层的全部子评论。楼层内部严格按页顺序，
+         * 楼层之间由 mapWithConcurrency 并行，请求间隔交给全局令牌桶。
+         */
+        const collectSubComments = async (floor) => {
+            const out = [];
+            if (!includeSub || !(floor.rcount > 0)) return out;
+
+            // 主评论接口已内联返回全部子评论时直接复用，省一次请求
+            const preview = Array.isArray(floor.replies) ? floor.replies : [];
+            if (preview.length > 0 && preview.length >= floor.rcount) return preview;
+
+            let subPage = 1;
+            let totalPages = 0;   // 0 表示未知，回退到「满页」判断
+
+            while (!cancelled()) {
+                if (subPage === 1 || subPage % 5 === 0) {
+                    log(`  正在抓取主评论 ${floor.rpid} 的子评论第 ${subPage} 页...`, 'info');
+                }
+
+                let data;
+                try {
+                    data = await fetchSubCommentsPage(oid, floor.rpid, subPage, signal);
+                } catch (e) {
+                    if (isAbortError(e) || cancelled()) break;
+                    failedFloors.push(String(floor.rpid));
+                    log(`  主评论 ${floor.rpid} 的子评论第 ${subPage} 页抓取失败：${e.message}`, 'error');
+                    break;
+                }
+
+                const subs = Array.isArray(data.replies) ? data.replies : [];
+                if (subs.length === 0) break;
+                for (const sub of subs) out.push(sub);
+
+                // 文档：data.page.count 为二级评论总数，用它算总页数比「返回不足 20 条」更可靠
+                if (!totalPages) {
+                    const count = data.page && data.page.count;
+                    if (count > 0) totalPages = Math.ceil(count / 20);
+                }
+                if (totalPages) {
+                    if (subPage >= totalPages) break;
+                } else if (subs.length < 20) {
+                    break;
+                }
+                subPage++;
+            }
+            return out;
+        };
 
         const pushComment = (item, isSub) => {
             const rpid = Number(item.rpid);
@@ -1643,70 +1790,39 @@
             let hasNewComments = false;
             let limitReached = false;
 
+            // 1) 按顺序挑出本页要处理的主评论：页内去重 + 按剩余额度裁剪
+            const pageSeen = new Set();
+            const tasks = [];
             for (const reply of currentReplies) {
-                if (cancelled()) break;
-
-                if (!pushComment(reply, false)) continue;
-                hasNewComments = true;
-
-                // 抓取楼中楼
-                if (includeSub && reply.rcount > 0) {
-                    const previewReplies = Array.isArray(reply.replies) ? reply.replies : [];
-
-                    if (previewReplies.length > 0 && previewReplies.length >= reply.rcount) {
-                        // 主评论接口已内联返回全部子评论，无需再发请求
-                        for (const subReply of previewReplies) pushComment(subReply, true);
-                    } else {
-                        let subPage = 1;
-                        let subTotalPages = 0;   // 0 表示未知，回退到「满页」判断
-
-                        while (!cancelled()) {
-                            if (subPage === 1 || subPage % 5 === 0) {
-                                log(`  正在抓取主评论 ${reply.rpid} 的子评论第 ${subPage} 页...`, 'info');
-                            }
-                            await sleep(requestDelay, signal);
-                            if (cancelled()) break;
-
-                            let subData;
-                            try {
-                                subData = await fetchSubCommentsPage(oid, reply.rpid, subPage, signal);
-                            } catch (e) {
-                                if (isAbortError(e) || cancelled()) break;
-                                failedFloors.push(String(reply.rpid));
-                                log(`  主评论 ${reply.rpid} 的子评论第 ${subPage} 页抓取失败：${e.message}`, 'error');
-                                break;
-                            }
-
-                            const subReplies = Array.isArray(subData.replies) ? subData.replies : [];
-                            if (subReplies.length === 0) break;
-
-                            for (const subReply of subReplies) pushComment(subReply, true);
-
-                            // 文档：data.page.count 为二级评论总数，用它算总页数比「返回不足 20 条」更可靠
-                            if (!subTotalPages) {
-                                const count = subData.page && subData.page.count;
-                                if (count > 0) subTotalPages = Math.ceil(count / 20);
-                            }
-                            if (subTotalPages) {
-                                if (subPage >= subTotalPages) break;
-                            } else if (subReplies.length < 20) {
-                                break;
-                            }
-                            subPage++;
-                        }
-                    }
-                }
-
-                mainCountFetched++;
-                if (limit && mainCountFetched >= limit) {
-                    log(`已达到设定的主评论获取上限 (${limit} 条)。`, 'warn');
+                const rpid = Number(reply.rpid);
+                if (!rpid || rpidMap.has(rpid) || pageSeen.has(rpid)) continue;
+                if (limit && (mainCountFetched + tasks.length) >= limit) {
                     limitReached = true;
                     break;
                 }
+                pageSeen.add(rpid);
+                tasks.push({ reply: reply, subs: [] });
+            }
+            if (limit && (mainCountFetched + tasks.length) >= limit) limitReached = true;
+
+            // 2) 并行抓取本页各楼层的楼中楼（并发数固定，实际速率由令牌桶控制）
+            if (tasks.length > 0) {
+                await mapWithConcurrency(tasks, SUB_FETCH_CONCURRENCY, async (task) => {
+                    task.subs = await collectSubComments(task.reply);
+                }, signal);
+            }
+
+            // 3) 按楼层顺序合并，保证 CSV 中「主评论 → 其楼中楼」始终相邻。
+            //    此时数据已在内存里，不需要再看取消标记，已抓到的不要浪费。
+            for (const task of tasks) {
+                if (!pushComment(task.reply, false)) continue;
+                hasNewComments = true;
+                for (const sub of task.subs) pushComment(sub, true);
+                mainCountFetched++;
             }
 
             if (limitReached) {
-                log('已按设定上限停止抓取，准备保存数据。', 'success');
+                log(`已达到设定的主评论获取上限 (${limit} 条)，准备保存数据。`, 'success');
                 completed = true;
                 break;
             }
@@ -1730,8 +1846,6 @@
                 completed = true;
                 break;
             }
-
-            await sleep(requestDelay, signal);
         }
 
         if (!completed && cancelled()) {
@@ -1744,7 +1858,7 @@
         return { allComments, stats, completed, failedFloors };
     }
 
-    async function exportUpComments(mid, upPages, skipPages, includeSub, limitPerVideo, requestDelay, options = {}) {
+    async function exportUpComments(mid, upPages, skipPages, includeSub, limitPerVideo, options = {}) {
         const signal = options.signal || null;
         const cancelled = () => shouldCancel || !!(signal && signal.aborted);
 
@@ -1797,7 +1911,6 @@
                 log('已抓取全部投稿视频。', 'success');
                 break;
             }
-            if (pageNum < endPage) await sleep(requestDelay, signal);
         }
 
         log(`共成功获取到 ${videos.length} 个视频。准备启动批量导出评论...`, 'success');
@@ -1820,7 +1933,6 @@
                     3, // 投稿列表按热度排序抓评论
                     includeSub,
                     limitPerVideo,
-                    requestDelay,
                     { signal }
                 );
 
@@ -1831,10 +1943,6 @@
             } catch (e) {
                 if (isAbortError(e) || cancelled()) break;
                 log(`视频 ${video.bvid} 导出失败：${e.message}`, 'error');
-            }
-
-            if (i < totalVideos - 1 && !cancelled()) {
-                await sleep(requestDelay * 2, signal);
             }
         }
 
@@ -1989,7 +2097,7 @@
     // ==========================================
     // 10. UI Generation & Control
     // ==========================================
-    const SCRIPT_VERSION = '0.4.0';
+    const SCRIPT_VERSION = '0.4.1';
     const ENTRY_BTN_ID = 'bili-cmt-entry';
     const SETTINGS_KEY = 'biliCmtExporter.settings.v1';
 
@@ -2152,6 +2260,7 @@
         if (subEl) subEl.innerText = '0';
         const logBox = document.getElementById('console-log');
         if (logBox) logBox.innerHTML = '';
+        logBuffer = [];
         lastProgressUpdate = 0;
         log('准备就绪，开始导出...', 'info');
     }
@@ -2552,6 +2661,8 @@
             shouldCancel = false;
             exportController = new AbortController();
             exportStartTime = Date.now();
+            // 请求间隔改由全局令牌桶统一调度（并发抓取时也只有它能约束整体 QPS）
+            rateLimiter.setInterval(delayVal);
             startProgressUI('视频评论导出中...');
 
             try {
@@ -2561,7 +2672,6 @@
                     mode,
                     includeSub,
                     limit,
-                    delayVal,
                     { signal: exportController.signal }
                 );
                 const title = getVideoTitle();
@@ -2578,6 +2688,7 @@
             } finally {
                 isExporting = false;
                 exportController = null;
+                rateLimiter.setInterval(0);
             }
         });
 
@@ -2600,6 +2711,7 @@
             shouldCancel = false;
             exportController = new AbortController();
             exportStartTime = Date.now();
+            rateLimiter.setInterval(delayVal);
             startProgressUI('UP 主视频批量导出中...');
 
             try {
@@ -2609,7 +2721,6 @@
                     skip,
                     includeSub,
                     limit,
-                    delayVal,
                     { signal: exportController.signal }
                 );
                 const upName = getUpName();
@@ -2626,6 +2737,7 @@
             } finally {
                 isExporting = false;
                 exportController = null;
+                rateLimiter.setInterval(0);
             }
         });
 
