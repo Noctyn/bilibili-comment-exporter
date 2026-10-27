@@ -5,8 +5,8 @@
 // @supportURL   https://github.com/Noctyn/bilibili-comment-exporter/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
-// @version      0.2.0
-// @description  一款基于 Bilibili API 的视频评论区导出工具，支持导出主评论和子评论（楼中楼）为 CSV 文件，带有 UTF-8 BOM 解决乱码，并有漂亮的玻璃质感 UI 和实时的 IP 属地、等级及性别数据统计图表。
+// @version      0.4.0
+// @description  一款基于 Bilibili API 的视频评论区导出工具，入口集成在视频工具栏与 UP 主空间页中，支持导出主评论和楼中楼为 CSV（UTF-8 BOM 防乱码），并带有实时 IP 属地、等级及性别数据统计看板。
 // @author       heroxv
 // @license      MIT
 // @icon         https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/assets/logo.svg
@@ -274,273 +274,568 @@
     }
 
     // ==========================================
-    // 3.5 Network Utilities (Timeout + Retry)
+    // 3.5 Network Utilities (Timeout / Retry / Abort)
     // ==========================================
     const FETCH_TIMEOUT_MS = 15000; // 15 seconds
     const MAX_RETRIES = 3;
 
-    function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+    /**
+     * 统一的接口错误：区分「业务错误码 / HTTP 状态 / 是否可重试」。
+     * retryable 为 true 时由 withRetry 做指数退避重试，false 时直接向上抛出。
+     */
+    class ApiError extends Error {
+        constructor(message, { code = null, status = null, retryable = false } = {}) {
+            super(message);
+            this.name = 'ApiError';
+            this.code = code;
+            this.status = status;
+            this.retryable = retryable;
+        }
+    }
+
+    function isAbortError(err) {
+        return !!err && (err.name === 'AbortError' || err.code === 'ABORT_ERR');
+    }
+
+    function abortError() {
+        return new DOMException('已取消', 'AbortError');
+    }
+
+    /**
+     * 带超时的 fetch，同时支持外部 AbortSignal（用于「取消导出」立即中断在途请求）。
+     */
+    function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS, externalSignal = null) {
+        if (externalSignal && externalSignal.aborted) {
+            return Promise.reject(abortError());
+        }
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
+        let onExternalAbort = null;
+
+        if (externalSignal) {
+            onExternalAbort = () => controller.abort();
+            externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+        }
+        const cleanup = () => {
+            clearTimeout(timer);
+            if (externalSignal && onExternalAbort) {
+                externalSignal.removeEventListener('abort', onExternalAbort);
+            }
+        };
+
         return fetch(url, { ...options, signal: controller.signal })
-            .then(response => { clearTimeout(timer); return response; })
+            .then(response => { cleanup(); return response; })
             .catch(err => {
-                clearTimeout(timer);
+                cleanup();
+                if (externalSignal && externalSignal.aborted) throw abortError();
                 if (err.name === 'AbortError') {
-                    throw new Error(`请求超时 (${timeoutMs / 1000}s)`);
+                    throw new ApiError(`请求超时 (${timeoutMs / 1000}s)`, { retryable: true });
                 }
-                throw err;
+                throw new ApiError(err.message || '网络请求失败', { retryable: true });
             });
     }
 
-    async function retryFetch(fetchFn, retries = MAX_RETRIES) {
+    /** 可中断的延时：取消导出时立即返回，不必等满整个间隔 */
+    function sleep(ms, signal = null) {
+        if (signal && signal.aborted) return Promise.resolve();
+        return new Promise(resolve => {
+            let onAbort = null;
+            const timer = setTimeout(() => {
+                if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+                resolve();
+            }, ms);
+            if (signal) {
+                onAbort = () => { clearTimeout(timer); resolve(); };
+                signal.addEventListener('abort', onAbort, { once: true });
+            }
+        });
+    }
+
+    /** 指数退避 + 随机抖动，避免多个请求在同一时刻重试 */
+    function backoffDelay(attempt) {
+        const base = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+        return base + Math.floor(Math.random() * 300);
+    }
+
+    /**
+     * 仅对「明确可重试」的错误做退避重试；参数错误 / 风控 / 用户取消一律立即失败。
+     */
+    async function withRetry(fetchFn, { retries = MAX_RETRIES, signal = null } = {}) {
         let lastError;
         for (let attempt = 1; attempt <= retries; attempt++) {
             try {
-                return await fetchFn();
+                return await fetchFn(attempt);
             } catch (err) {
                 lastError = err;
-                if (attempt < retries) {
-                    const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
-                    await new Promise(r => setTimeout(r, backoffMs));
-                }
+                const cancelled = isAbortError(err) || (signal && signal.aborted);
+                if (cancelled) throw err;
+                if (err.retryable !== true || attempt >= retries) throw err;
+                await sleep(backoffDelay(attempt), signal);
             }
         }
         throw lastError;
     }
 
     // ==========================================
-    // 3.6 Wbi Key Cache (5-min TTL)
+    // 3.6 Wbi Key Cache (memory 5min + localStorage 6h)
+    // Wbi Key 全站统一且每日才更替，可跨页面/会话缓存以减少 nav 请求
     // ==========================================
     let cachedWbiKeys = null;
     let wbiKeysCachedAt = 0;
-    const WBI_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+    let wbiLoginState = null;                    // null=未知, true=已登录, false=未登录
+    const WBI_CACHE_TTL_MS = 5 * 60 * 1000;      // 内存缓存有效期
+    const WBI_STORE_TTL_MS = 6 * 60 * 60 * 1000; // 本地缓存有效期（key 实际每日更替）
+    const WBI_STORE_KEY = 'biliCmtExporter.wbiKeys';
+
+    function readStoredWbiKeys() {
+        try {
+            const raw = localStorage.getItem(WBI_STORE_KEY);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (!parsed || !parsed.imgKey || !parsed.subKey || !parsed.at) return null;
+            const expired = Date.now() - parsed.at > WBI_STORE_TTL_MS;
+            // Key 为每日更替：跨天缓存必然失效，提前丢弃，避免带着旧密钥去撞 -403
+            const staleDay = new Date(parsed.at).toDateString() !== new Date().toDateString();
+            if (expired || staleDay) {
+                localStorage.removeItem(WBI_STORE_KEY);
+                return null;
+            }
+            return { imgKey: parsed.imgKey, subKey: parsed.subKey };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function storeWbiKeys(keys) {
+        try {
+            localStorage.setItem(WBI_STORE_KEY, JSON.stringify({
+                imgKey: keys.imgKey,
+                subKey: keys.subKey,
+                at: Date.now()
+            }));
+        } catch (e) { /* localStorage 不可用时静默降级 */ }
+    }
+
+    function invalidateWbiKeys() {
+        cachedWbiKeys = null;
+        wbiKeysCachedAt = 0;
+        try {
+            localStorage.removeItem(WBI_STORE_KEY);
+        } catch (e) { /* 忽略 */ }
+    }
 
     async function getCachedWbiKeys() {
         const now = Date.now();
         if (cachedWbiKeys && (now - wbiKeysCachedAt) < WBI_CACHE_TTL_MS) {
             return cachedWbiKeys;
         }
+        const stored = readStoredWbiKeys();
+        if (stored) {
+            cachedWbiKeys = stored;
+            wbiKeysCachedAt = now;
+            log('使用本地缓存的 Wbi 签名密钥。', 'info');
+            return stored;
+        }
         const keys = await getWbiKeys();
         cachedWbiKeys = keys;
         wbiKeysCachedAt = now;
+        storeWbiKeys(keys);
         return keys;
     }
 
     // ==========================================
     // 4. API Client Integration
     // ==========================================
+    const API_BASE = 'https://api.bilibili.com';
+
     async function getWbiKeys() {
-        return retryFetch(async () => {
-            const response = await fetchWithTimeout('https://api.bilibili.com/x/web-interface/nav', { credentials: 'include' });
-            const json = await response.json();
-            if (json.code !== 0) {
-                throw new Error(`获取 Wbi Key 失败: ${json.message}`);
+        return withRetry(async () => {
+            const response = await fetchWithTimeout(`${API_BASE}/x/web-interface/nav`, { credentials: 'include' });
+            if (!response.ok) {
+                throw new ApiError(`获取 Wbi Key 失败: HTTP ${response.status}`, { status: response.status, retryable: response.status >= 500 });
             }
-            const imgUrl = json.data.wbi_img.img_url;
-            const subUrl = json.data.wbi_img.sub_url;
-            const imgKey = imgUrl.split('/').pop().split('.')[0];
-            const subKey = subUrl.split('/').pop().split('.')[0];
+            const json = await response.json();
+            // 未登录时 code 为 -101，但 data.wbi_img 依然会返回，可直接用于签名
+            if (json.code !== 0 && json.code !== -101) {
+                throw new ApiError(`获取 Wbi Key 失败: ${json.message}`, { code: json.code });
+            }
+            const wbiImg = json.data && json.data.wbi_img;
+            if (!wbiImg || !wbiImg.img_url || !wbiImg.sub_url) {
+                throw new ApiError('获取 Wbi Key 失败: 响应缺少 wbi_img 字段');
+            }
+            // 记录登录态：IP 属地等字段需要登录才返回，未登录时提前告知用户
+            const isLogin = !!(json.data && json.data.isLogin);
+            wbiLoginState = isLogin;
+            if (!isLogin) {
+                log('当前未登录 B 站：IP 属地等需要登录的字段将缺失。', 'warn');
+            }
+            const imgKey = wbiImg.img_url.split('/').pop().split('.')[0];
+            const subKey = wbiImg.sub_url.split('/').pop().split('.')[0];
+            if (!imgKey || !subKey) {
+                throw new ApiError('获取 Wbi Key 失败: 无法从 img_url/sub_url 解析密钥');
+            }
             return { imgKey, subKey };
         });
     }
 
-    async function fetchCommentsPage(oid, mode, paginationStr, imgKey, subKey) {
-        return retryFetch(async () => {
-            const baseUrl = 'https://api.bilibili.com/x/v2/reply/wbi/main';
-            let paginationStrParam = '{"offset":""}';
-            if (paginationStr) {
-                paginationStrParam = JSON.stringify({ offset: paginationStr });
+    /**
+     * 统一的 GET 请求入口：负责 Wbi 签名、超时、状态码、业务错误码与重试分类。
+     * 成功时返回 data 本体（保证非 null），失败时抛出 ApiError。
+     */
+    async function apiGet(path, params = {}, { wbi = false, signal = null, retries = MAX_RETRIES } = {}) {
+        let wbiRefreshed = false;
+
+        return withRetry(async () => {
+            let url;
+            if (wbi) {
+                let keys;
+                try {
+                    keys = await getCachedWbiKeys();
+                } catch (e) {
+                    // 拿不到密钥时不要伪造签名（空 mixin_key 必然 -403），直接失败并给出可操作提示
+                    if (isAbortError(e)) throw e;
+                    throw new ApiError(`获取 Wbi 签名密钥失败：${e.message}，请刷新页面或先登录后重试`, { retryable: false });
+                }
+                url = signWbiUrl(API_BASE + path, params, keys.imgKey, keys.subKey);
+            } else {
+                url = `${API_BASE}${path}?${new URLSearchParams(params).toString()}`;
             }
-            const params = {
-                oid: oid,
-                type: 1,
-                mode: mode, // 2 = time, 3 = hot
-                pagination_str: paginationStrParam,
-                plat: 1,
-                seek_rpid: '',
-                web_location: '1315875'
-            };
-            const signedUrl = signWbiUrl(baseUrl, params, imgKey, subKey);
-            const response = await fetchWithTimeout(signedUrl, { credentials: 'include' });
-            return await response.json();
-        });
+
+            const response = await fetchWithTimeout(url, { credentials: 'include' }, FETCH_TIMEOUT_MS, signal);
+
+            // 412 = 风控拦截，继续重试只会加深风控分，直接失败让调用方停止
+            if (response.status === 412) {
+                throw new ApiError('触发风控校验 (HTTP 412)，请增大请求间隔或稍后再试', { status: 412 });
+            }
+            if (response.status === 429) {
+                throw new ApiError('请求过于频繁 (HTTP 429)，正在退避重试', { status: 429, retryable: true });
+            }
+            if (!response.ok) {
+                throw new ApiError(`HTTP ${response.status}`, { status: response.status, retryable: response.status >= 500 });
+            }
+
+            let json;
+            try {
+                json = await response.json();
+            } catch (e) {
+                throw new ApiError('响应不是合法 JSON（可能被风控页面拦截）', { retryable: true });
+            }
+
+            if (json.code === 0) {
+                // 文档：w_rid/wts 缺失或错误时可能返回 code 0 + data.v_voucher
+                if (json.data && json.data.v_voucher) {
+                    throw new ApiError('接口返回验证码挑战 (v_voucher)，请稍后重试或更换网络环境', { code: -352 });
+                }
+                return json.data || {};
+            }
+
+            // -403 = Wbi 签名被拒（密钥可能已更替）：刷新密钥后重试一次
+            if (json.code === -403 && !wbiRefreshed) {
+                wbiRefreshed = true;
+                invalidateWbiKeys();
+                throw new ApiError('Wbi 签名被拒 (-403)，已刷新密钥，正在重试', { code: -403, retryable: true });
+            }
+
+            // 走到这里说明 -403 已经刷新过密钥仍被拒，再重试没有意义
+            throw new ApiError(describeApiError(json.code, json.message), { code: json.code });
+        }, { retries, signal });
     }
 
-    async function fetchSubCommentsPage(oid, rootRpid, pageNum) {
-        return retryFetch(async () => {
-            const params = new URLSearchParams({
-                oid: oid,
-                type: '1',
-                root: rootRpid.toString(),
-                ps: '20',
-                pn: pageNum.toString(),
-                web_location: '333.788'
-            });
-            const url = `https://api.bilibili.com/x/v2/reply/reply?${params.toString()}`;
-            const response = await fetchWithTimeout(url, { credentials: 'include' });
-            return await response.json();
-        });
+    async function fetchCommentsPage(oid, mode, paginationStr, signal = null) {
+        const params = {
+            oid: oid,
+            type: 1,
+            mode: mode, // 2 = 仅按时间, 3 = 仅按热度
+            pagination_str: JSON.stringify({ offset: paginationStr || '' }),
+            plat: 1,
+            seek_rpid: '',
+            web_location: '1315875'
+        };
+        const data = await apiGet('/x/v2/reply/wbi/main', params, { wbi: true, signal });
+        if (!data.cursor) {
+            throw new ApiError('响应缺少 cursor 字段（可能触发风控），已停止抓取');
+        }
+        return data;
     }
 
-    async function fetchUpVideosPage(mid, pageNum, order, imgKey, subKey) {
-        return retryFetch(async () => {
-            const baseUrl = 'https://api.bilibili.com/x/space/wbi/arc/search';
-            const params = {
-                mid: mid,
-                order: order, // 'pubdate', 'click', 'stow'
-                platform: 'web',
-                pn: pageNum,
-                ps: '30',
-                tid: '0'
-            };
-            const signedUrl = signWbiUrl(baseUrl, params, imgKey, subKey);
-            const response = await fetchWithTimeout(signedUrl, { credentials: 'include' });
-            return await response.json();
-        });
+    async function fetchSubCommentsPage(oid, rootRpid, pageNum, signal = null) {
+        return apiGet('/x/v2/reply/reply', {
+            oid: oid,
+            type: 1,
+            root: rootRpid.toString(),
+            ps: 20,   // 文档：1-49，但单页最多返回 20 条
+            pn: pageNum,
+            web_location: '333.788'
+        }, { signal });
+    }
+
+    async function fetchUpVideosPage(mid, pageNum, order, signal = null) {
+        return apiGet('/x/space/wbi/arc/search', {
+            mid: mid,
+            order: order, // 'pubdate', 'click', 'stow'
+            platform: 'web',
+            pn: pageNum,
+            ps: 30,
+            tid: 0
+        }, { wbi: true, signal });
     }
 
     // ==========================================
     // 5. CSS Styling (Injected)
     // ==========================================
     const CSS_STYLES = `
-        :root {
-            --bili-pink: #fb7299;
-            --bili-pink-hover: #ff6699;
-            --bili-blue: #00aeec;
-            --bili-blue-hover: #33bdf0;
-            --text-main: #18191c;
-            --text-sub: #9499a0;
-            --border-color: rgba(251, 114, 153, 0.2);
-            --glass-bg: rgba(255, 255, 255, 0.88);
-            --glass-border: rgba(255, 255, 255, 0.45);
-            --glass-shadow: 0 16px 48px rgba(0, 0, 0, 0.12);
-        }
-
-        .bili-cmt-float-btn {
-            position: fixed;
-            right: 25px;
-            bottom: 110px;
-            z-index: 99999;
-            background: linear-gradient(135deg, var(--bili-pink), #ff9eb6);
-            color: white;
-            border-radius: 50px;
-            padding: 10px 18px;
-            box-shadow: 0 6px 20px rgba(251, 114, 153, 0.4);
+        /* ========== 视频工具栏入口 ========== */
+        .bili-cmt-entry {
             display: flex;
             align-items: center;
             gap: 8px;
             cursor: pointer;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
             font-size: 13px;
-            font-weight: 600;
-            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            font-weight: 500;
+            color: #61666d;
+            height: 100%;
+            padding: 0 2px;
             user-select: none;
-            border: 1px solid rgba(255, 255, 255, 0.2);
+            -webkit-user-select: none;
+            white-space: nowrap;
+            transition: color 0.2s ease, transform 0.15s ease;
         }
+        .bili-cmt-entry:hover { color: #00aeec; }
+        .bili-cmt-entry:active { transform: scale(0.93); }
+        .bili-cmt-entry svg { display: block; width: 26px; height: 26px; flex-shrink: 0; }
+        .bili-cmt-entry.bili-cmt-dark { color: #a2aab3; }
+        .bili-cmt-entry.bili-cmt-dark:hover { color: #40c4f5; }
 
-        .bili-cmt-float-btn:hover {
-            transform: translateY(-3px) scale(1.03);
-            box-shadow: 0 8px 25px rgba(251, 114, 153, 0.5);
-            background: linear-gradient(135deg, var(--bili-pink-hover), #ffb3c5);
+        /* ========== 空间页入口 ========== */
+        .bili-cmt-entry-space {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+            height: 34px;
+            padding: 0 16px;
+            margin-left: 8px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.14);
+            color: #fff;
+            font-size: 14px;
+            font-weight: 700;
+            font-family: "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", -apple-system, sans-serif;
+            cursor: pointer;
+            user-select: none;
+            -webkit-user-select: none;
+            white-space: nowrap;
+            transition: background 0.2s ease, transform 0.15s ease;
         }
-
-        .bili-cmt-float-btn:active {
-            transform: translateY(1px) scale(0.98);
+        .bili-cmt-entry-space:hover { background: rgba(255, 255, 255, 0.26); }
+        .bili-cmt-entry-space:active { transform: scale(0.96); }
+        .bili-cmt-entry-space svg { width: 18px; height: 18px; }
+        .bili-cmt-entry-space.bili-cmt-entry-space-legacy {
+            height: 38px;
+            background: #f1f2f3;
+            color: #61666d;
         }
+        .bili-cmt-entry-space.bili-cmt-entry-space-legacy:hover { background: #e3e5e7; color: #fb7299; }
 
-        .bili-cmt-panel {
+        /* ========== Toast 通知 ========== */
+        .bili-cmt-toast-container {
             position: fixed;
-            right: 25px;
-            bottom: 170px;
-            width: 440px;
-            z-index: 99998;
-            background: var(--glass-bg);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            border: 1px solid var(--glass-border);
-            box-shadow: var(--glass-shadow);
-            border-radius: 20px;
-            padding: 22px;
-            font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
-            color: var(--text-main);
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 2147483647;
             display: flex;
             flex-direction: column;
-            gap: 16px;
-            transition: all 0.3s ease;
-            max-height: 80vh;
-            overflow-y: auto;
-            box-sizing: border-box;
-            text-align: left;
+            align-items: center;
+            gap: 10px;
+            pointer-events: none;
+            font-family: "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", -apple-system, sans-serif;
+        }
+        .bili-cmt-toast {
+            pointer-events: auto;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(28, 30, 33, 0.92);
+            color: #fff;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 10px 18px;
+            border-radius: 12px;
+            box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            animation: bceToastIn 0.28s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+            max-width: 68vw;
+            word-break: break-all;
+            line-height: 1.4;
+        }
+        .bili-cmt-toast svg { width: 16px; height: 16px; flex-shrink: 0; }
+        .bili-cmt-toast.success svg { color: #6ede9c; }
+        .bili-cmt-toast.error svg { color: #ff8f8f; }
+        .bili-cmt-toast.info svg { color: #7fd0ff; }
+        .bili-cmt-toast.out { animation: bceToastOut 0.22s ease forwards; }
+        @keyframes bceToastIn {
+            from { opacity: 0; transform: translateY(-14px) scale(0.94); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        @keyframes bceToastOut {
+            to { opacity: 0; transform: translateY(-10px) scale(0.94); }
         }
 
-        .bili-cmt-panel::-webkit-scrollbar {
+        /* ========== 控制面板 ========== */
+        .bili-cmt-panel {
+            --bce-accent: #fb7299;
+            --bce-accent-strong: #f25d8e;
+            --bce-accent-soft: rgba(251, 114, 153, 0.12);
+            --bce-blue: #00aeec;
+            --bce-text-1: #18191c;
+            --bce-text-2: #61666d;
+            --bce-text-3: #9499a0;
+            --bce-fill-1: rgba(0, 0, 0, 0.035);
+            --bce-fill-2: rgba(0, 0, 0, 0.07);
+            --bce-line: rgba(0, 0, 0, 0.08);
+            --bce-input-bg: rgba(0, 0, 0, 0.02);
+            --bce-input-line: rgba(0, 0, 0, 0.15);
+            --bce-card: rgba(255, 255, 255, 0.6);
+            --bce-glass: rgba(255, 255, 255, 0.88);
+            --bce-seg-active: #ffffff;
+            --bce-console-bg: rgba(0, 0, 0, 0.035);
+            --bce-shadow: 0 24px 64px rgba(0, 0, 0, 0.16), 0 2px 10px rgba(0, 0, 0, 0.06);
+
+            position: fixed;
+            right: 24px;
+            bottom: 24px;
+            width: 460px;
+            max-width: calc(100vw - 32px);
+            z-index: 100000;
+            background: var(--bce-glass);
+            backdrop-filter: blur(24px) saturate(1.4);
+            -webkit-backdrop-filter: blur(24px) saturate(1.4);
+            border: 1px solid var(--bce-line);
+            border-radius: 18px;
+            box-shadow: var(--bce-shadow);
+            padding: 18px 20px 20px;
+            font-family: "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: var(--bce-text-1);
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            max-height: min(82vh, 760px);
+            overflow: hidden;
+            box-sizing: border-box;
+            text-align: left;
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(14px) scale(0.97);
+            transition: opacity 0.22s ease, transform 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.15), visibility 0.22s;
+        }
+        .bili-cmt-panel.bili-cmt-open {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0) scale(1);
+        }
+        .bili-cmt-panel.bili-cmt-dragging { transition: none; }
+        .bili-cmt-panel.bili-cmt-dark {
+            --bce-text-1: #e3e5e7;
+            --bce-text-2: #a2aab3;
+            --bce-text-3: #71767d;
+            --bce-fill-1: rgba(255, 255, 255, 0.06);
+            --bce-fill-2: rgba(255, 255, 255, 0.1);
+            --bce-line: rgba(255, 255, 255, 0.1);
+            --bce-input-bg: rgba(255, 255, 255, 0.05);
+            --bce-input-line: rgba(255, 255, 255, 0.16);
+            --bce-card: rgba(255, 255, 255, 0.04);
+            --bce-glass: rgba(22, 24, 27, 0.92);
+            --bce-seg-active: rgba(255, 255, 255, 0.16);
+            --bce-console-bg: rgba(0, 0, 0, 0.25);
+            --bce-shadow: 0 24px 64px rgba(0, 0, 0, 0.55), 0 2px 10px rgba(0, 0, 0, 0.4);
+        }
+
+        .bili-cmt-panel::-webkit-scrollbar,
+        .bili-cmt-body::-webkit-scrollbar,
+        .bili-cmt-console::-webkit-scrollbar {
             width: 6px;
         }
-        .bili-cmt-panel::-webkit-scrollbar-track {
-            background: transparent;
-        }
-        .bili-cmt-panel::-webkit-scrollbar-thumb {
-            background: rgba(0, 0, 0, 0.15);
+        .bili-cmt-panel::-webkit-scrollbar-track,
+        .bili-cmt-body::-webkit-scrollbar-track,
+        .bili-cmt-console::-webkit-scrollbar-track { background: transparent; }
+        .bili-cmt-panel::-webkit-scrollbar-thumb,
+        .bili-cmt-body::-webkit-scrollbar-thumb,
+        .bili-cmt-console::-webkit-scrollbar-thumb {
+            background: var(--bce-fill-2);
             border-radius: 10px;
-        }
-        .bili-cmt-panel::-webkit-scrollbar-thumb:hover {
-            background: rgba(0, 0, 0, 0.25);
         }
 
         .bili-cmt-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-bottom: 1px solid rgba(0, 0, 0, 0.06);
-            padding-bottom: 10px;
+            cursor: grab;
+            user-select: none;
+            -webkit-user-select: none;
         }
+        .bili-cmt-header:active { cursor: grabbing; }
 
         .bili-cmt-title-area h3 {
             margin: 0;
-            font-size: 16px;
-            font-weight: 700;
-            color: var(--bili-pink);
-            background: linear-gradient(90deg, var(--bili-pink), #e03e7a);
+            font-size: 17px;
+            font-weight: 800;
+            letter-spacing: 0.5px;
+            background: linear-gradient(90deg, var(--bce-accent), #e03e7a);
             -webkit-background-clip: text;
+            background-clip: text;
             -webkit-text-fill-color: transparent;
         }
-
         .bili-cmt-subtitle {
             font-size: 10px;
-            color: var(--text-sub);
+            color: var(--bce-text-3);
             display: block;
             margin-top: 2px;
+            letter-spacing: 0.3px;
         }
-
-        .bili-cmt-close-btn {
+        .bili-cmt-icon-btn {
             background: transparent;
             border: none;
-            font-size: 24px;
-            color: var(--text-sub);
+            color: var(--bce-text-3);
             cursor: pointer;
-            transition: all 0.2s;
-            line-height: 18px;
-            height: 24px;
-            width: 24px;
+            width: 30px;
+            height: 30px;
             display: flex;
             align-items: center;
             justify-content: center;
             border-radius: 50%;
+            transition: all 0.2s;
+            outline: none;
+            padding: 0;
         }
-        .bili-cmt-close-btn:hover {
-            color: var(--bili-pink);
-            background: rgba(251, 114, 153, 0.1);
+        .bili-cmt-icon-btn:hover {
+            color: var(--bce-accent);
+            background: var(--bce-accent-soft);
         }
+        .bili-cmt-icon-btn svg { width: 17px; height: 17px; }
+
+        .bili-cmt-body {
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            min-height: 0;
+            overflow-y: auto;
+            padding-right: 2px;
+        }
+        .bili-cmt-mode-progress .bili-cmt-tabs,
+        .bili-cmt-mode-progress .bili-cmt-tab-content,
+        .bili-cmt-mode-dashboard .bili-cmt-tabs,
+        .bili-cmt-mode-dashboard .bili-cmt-tab-content { display: none !important; }
 
         .bili-cmt-tabs {
             display: flex;
-            background: rgba(0, 0, 0, 0.04);
+            background: var(--bce-fill-1);
             border-radius: 10px;
             padding: 3px;
             gap: 4px;
         }
-
         .bili-cmt-tab {
             flex: 1;
             text-align: center;
@@ -549,15 +844,15 @@
             font-weight: 600;
             cursor: pointer;
             border-radius: 8px;
-            color: var(--text-sub);
+            color: var(--bce-text-3);
             transition: all 0.2s;
             user-select: none;
+            -webkit-user-select: none;
         }
-
         .bili-cmt-tab.active {
-            background: white;
-            color: var(--bili-pink);
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+            background: var(--bce-seg-active);
+            color: var(--bce-accent);
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
         }
 
         .bili-cmt-tab-content {
@@ -565,90 +860,72 @@
             flex-direction: column;
             gap: 14px;
         }
-
-        .bili-cmt-tab-content.active {
-            display: flex;
-        }
+        .bili-cmt-tab-content.active { display: flex; }
 
         .bili-cmt-form-group {
             display: flex;
             flex-direction: column;
             gap: 6px;
         }
-
         .bili-cmt-form-group label {
             font-size: 12px;
             font-weight: 600;
-            color: #61666d;
+            color: var(--bce-text-2);
         }
-
         .bili-cmt-form-group input[type="text"],
         .bili-cmt-form-group input[type="number"] {
-            background: rgba(255, 255, 255, 0.7);
-            border: 1px solid rgba(0, 0, 0, 0.12);
-            border-radius: 8px;
+            background: var(--bce-input-bg);
+            border: 1px solid var(--bce-input-line);
+            border-radius: 9px;
             padding: 9px 12px;
             font-size: 13px;
             outline: none;
-            transition: all 0.2s;
-            color: var(--text-main);
+            transition: border-color 0.2s, box-shadow 0.2s;
+            color: var(--bce-text-1);
+            font-family: inherit;
+            width: 100%;
+            box-sizing: border-box;
         }
-
         .bili-cmt-form-group input[type="text"]:focus,
         .bili-cmt-form-group input[type="number"]:focus {
-            border-color: var(--bili-pink);
-            background: white;
-            box-shadow: 0 0 0 3px rgba(251, 114, 153, 0.15);
+            border-color: var(--bce-accent);
+            box-shadow: 0 0 0 3px var(--bce-accent-soft);
+        }
+        .bili-cmt-form-group input::placeholder { color: var(--bce-text-3); opacity: 1; }
+        .bili-cmt-shake { animation: bceShake 0.4s ease; border-color: #f05a5a !important; }
+        @keyframes bceShake {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-4px); }
+            75% { transform: translateX(4px); }
         }
 
-        .bili-cmt-form-row {
-            display: flex;
-            gap: 12px;
-        }
-
-        .bili-cmt-form-group.half {
-            flex: 1;
-            width: 50%;
-        }
+        .bili-cmt-form-row { display: flex; gap: 12px; }
+        .bili-cmt-form-group.half { flex: 1; width: 50%; }
 
         .bili-cmt-segmented {
             display: flex;
-            background: rgba(0, 0, 0, 0.04);
-            border-radius: 8px;
+            background: var(--bce-fill-1);
+            border-radius: 9px;
             padding: 3px;
-            gap: 4px;
+            gap: 2px;
         }
-
-        .bili-cmt-segment-item {
-            flex: 1;
-            position: relative;
-            cursor: pointer;
-            text-align: center;
-        }
-
-        .bili-cmt-segment-item input {
-            position: absolute;
-            opacity: 0;
-            cursor: pointer;
-            height: 0;
-            width: 0;
-        }
-
+        .bili-cmt-segment-item { flex: 1; position: relative; cursor: pointer; text-align: center; }
+        .bili-cmt-segment-item input { position: absolute; opacity: 0; cursor: pointer; height: 0; width: 0; }
         .bili-cmt-segment-item span {
             display: block;
             padding: 7px 10px;
             font-size: 12px;
             font-weight: 600;
-            color: var(--text-sub);
-            border-radius: 6px;
+            color: var(--bce-text-3);
+            border-radius: 7px;
             transition: all 0.2s;
             user-select: none;
+            -webkit-user-select: none;
         }
-
         .bili-cmt-segment-item input:checked + span {
-            background: white;
-            color: var(--bili-pink);
-            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.04);
+            background: var(--bce-seg-active);
+            color: var(--bce-accent);
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
         }
 
         .bili-cmt-checkbox-label {
@@ -657,16 +934,12 @@
             gap: 8px;
             font-size: 12px;
             font-weight: 600;
-            color: #61666d;
+            color: var(--bce-text-2);
             cursor: pointer;
             user-select: none;
+            -webkit-user-select: none;
         }
-
-        .bili-cmt-checkbox-label input {
-            accent-color: var(--bili-pink);
-            width: 15px;
-            height: 15px;
-        }
+        .bili-cmt-checkbox-label input { accent-color: var(--bce-accent); width: 15px; height: 15px; cursor: pointer; }
 
         .bili-cmt-btn {
             border: none;
@@ -674,120 +947,115 @@
             padding: 11px 20px;
             font-size: 14px;
             font-weight: 600;
+            font-family: inherit;
             cursor: pointer;
-            transition: all 0.2s;
+            transition: transform 0.15s ease, box-shadow 0.2s ease, background 0.2s ease, opacity 0.2s ease;
             text-align: center;
             outline: none;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 7px;
         }
-
+        .bili-cmt-btn:disabled { opacity: 0.55; pointer-events: none; }
         .bili-cmt-btn.primary {
-            background: linear-gradient(135deg, var(--bili-pink), #ff84a1);
-            color: white;
-            box-shadow: 0 4px 12px rgba(251, 114, 153, 0.3);
+            background: linear-gradient(135deg, var(--bce-accent), #ff8aa8);
+            color: #fff;
+            box-shadow: 0 6px 16px rgba(251, 114, 153, 0.32);
         }
-
         .bili-cmt-btn.primary:hover {
-            background: linear-gradient(135deg, var(--bili-pink-hover), #ff9eb6);
-            box-shadow: 0 6px 16px rgba(251, 114, 153, 0.4);
+            background: linear-gradient(135deg, var(--bce-accent-strong), #ff9cb4);
+            box-shadow: 0 8px 20px rgba(251, 114, 153, 0.4);
             transform: translateY(-1px);
         }
-
-        .bili-cmt-btn.primary:active {
-            transform: translateY(1px);
-        }
-
+        .bili-cmt-btn.primary:active { transform: translateY(0) scale(0.98); }
         .bili-cmt-btn.danger {
-            background: #ff4d4f;
-            color: white;
+            background: transparent;
+            color: #f05a5a;
+            border: 1px solid rgba(240, 90, 90, 0.4);
         }
-        .bili-cmt-btn.danger:hover {
-            background: #ff7875;
-        }
-
+        .bili-cmt-btn.danger:hover { background: rgba(240, 90, 90, 0.08); }
         .bili-cmt-btn-text {
             background: transparent;
             border: none;
-            color: var(--bili-blue);
+            color: var(--bce-blue);
             font-size: 12px;
             font-weight: 600;
+            font-family: inherit;
             cursor: pointer;
             outline: none;
+            padding: 0;
         }
-        .bili-cmt-btn-text:hover {
-            color: var(--bili-blue-hover);
-        }
+        .bili-cmt-btn-text:hover { opacity: 0.8; }
 
-        /* Progress Panel Styles */
+        /* ========== 进度视图 ========== */
         .bili-cmt-progress-panel {
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(255, 255, 255, 0.95);
-            backdrop-filter: blur(20px);
-            border-radius: 20px;
-            padding: 22px;
-            z-index: 100;
-            display: flex;
+            display: none;
             flex-direction: column;
-            gap: 14px;
-            box-sizing: border-box;
+            gap: 12px;
         }
-
         .bili-cmt-progress-header {
             display: flex;
             justify-content: space-between;
-            align-items: center;
+            align-items: baseline;
         }
-
         .bili-cmt-progress-header h4 {
             margin: 0;
             font-size: 15px;
-            color: var(--bili-pink);
+            color: var(--bce-accent);
             font-weight: 700;
         }
-
         #progress-speed {
             font-size: 11px;
-            color: var(--text-sub);
+            color: var(--bce-text-3);
             font-weight: 600;
         }
-
+        #progress-percent {
+            font-size: 20px;
+            font-weight: 800;
+            color: var(--bce-accent);
+            font-variant-numeric: tabular-nums;
+        }
         .bili-cmt-progress-bar-container {
-            background: rgba(0, 0, 0, 0.06);
+            background: var(--bce-fill-2);
             height: 8px;
             border-radius: 10px;
             overflow: hidden;
         }
-
         .bili-cmt-progress-bar-fill {
-            background: linear-gradient(90deg, var(--bili-pink), var(--bili-blue));
+            background: linear-gradient(90deg, var(--bce-accent), var(--bce-blue));
             height: 100%;
             border-radius: 10px;
             width: 0%;
-            transition: width 0.2s ease;
+            transition: width 0.25s ease;
         }
-
+        /* 分母不可靠时的不确定进度：滑动光条，避免显示错误的百分比 */
+        .bili-cmt-progress-bar-fill.indeterminate {
+            width: 32% !important;
+            background: linear-gradient(90deg, transparent, var(--bce-accent), var(--bce-blue), transparent);
+            animation: bce-progress-slide 1.3s ease-in-out infinite;
+        }
+        @keyframes bce-progress-slide {
+            0% { transform: translateX(-110%); }
+            100% { transform: translateX(330%); }
+        }
         .bili-cmt-stats-summary {
             display: flex;
             gap: 20px;
             font-size: 12px;
             font-weight: 600;
-            color: #61666d;
+            color: var(--bce-text-2);
         }
-
         .bili-cmt-badge {
-            background: rgba(251, 114, 153, 0.1);
-            color: var(--bili-pink);
+            background: var(--bce-accent-soft);
+            color: var(--bce-accent);
             padding: 2px 8px;
             border-radius: 20px;
             font-weight: 700;
         }
-
         .bili-cmt-console {
-            background: rgba(0, 0, 0, 0.04);
-            border: 1px solid rgba(0, 0, 0, 0.06);
+            background: var(--bce-console-bg);
+            border: 1px solid var(--bce-line);
             border-radius: 10px;
             padding: 12px;
             font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
@@ -798,49 +1066,29 @@
             flex-direction: column;
             gap: 6px;
             text-align: left;
-            max-height: 220px;
+            min-height: 180px;
+            max-height: 240px;
+            box-sizing: border-box;
         }
-
-        .log-line {
-            word-break: break-all;
-            line-height: 1.4;
-        }
-        .log-line.info { color: #61666d; }
+        .log-line { word-break: break-all; line-height: 1.4; }
+        .log-line.info { color: var(--bce-text-2); }
         .log-line.success { color: #2ecc71; font-weight: 600; }
         .log-line.error { color: #e74c3c; font-weight: 600; }
         .log-line.warn { color: #f39c12; }
 
-        /* Dashboard Styles */
-        .bili-cmt-dashboard {
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
-        }
-
+        /* ========== 数据看板 ========== */
+        .bili-cmt-dashboard { display: none; flex-direction: column; gap: 14px; }
         .dashboard-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-bottom: 1px solid rgba(0, 0, 0, 0.06);
-            padding-bottom: 8px;
         }
-
-        .dashboard-header h4 {
-            margin: 0;
-            font-size: 15px;
-            color: var(--bili-pink);
-            font-weight: 700;
-        }
-
-        .dashboard-summary-cards {
-            display: flex;
-            gap: 10px;
-        }
-
+        .dashboard-header h4 { margin: 0; font-size: 15px; color: var(--bce-accent); font-weight: 700; }
+        .dashboard-summary-cards { display: flex; gap: 10px; }
         .summary-card {
             flex: 1;
-            background: rgba(255, 255, 255, 0.65);
-            border: 1px solid rgba(251, 114, 153, 0.15);
+            background: var(--bce-card);
+            border: 1px solid var(--bce-line);
             border-radius: 12px;
             padding: 12px 6px;
             display: flex;
@@ -848,57 +1096,27 @@
             align-items: center;
             gap: 4px;
         }
-
-        .card-num {
-            font-size: 16px;
-            font-weight: 800;
-            color: var(--bili-pink);
-        }
-
-        .card-label {
-            font-size: 9px;
-            color: var(--text-sub);
-            font-weight: 600;
-            text-align: center;
-        }
-
-        .dashboard-charts {
-            display: flex;
-            flex-direction: column;
-            gap: 14px;
-        }
-
+        .card-num { font-size: 18px; font-weight: 800; color: var(--bce-accent); font-variant-numeric: tabular-nums; }
+        .card-label { font-size: 9px; color: var(--bce-text-3); font-weight: 600; text-align: center; }
+        .dashboard-charts { display: flex; flex-direction: column; gap: 12px; }
         .chart-section {
-            background: rgba(255, 255, 255, 0.55);
-            border: 1px solid rgba(0, 0, 0, 0.05);
+            background: var(--bce-card);
+            border: 1px solid var(--bce-line);
             border-radius: 12px;
             padding: 12px;
             display: flex;
             flex-direction: column;
             gap: 8px;
         }
-
         .chart-section h5 {
             margin: 0;
             font-size: 11px;
             font-weight: 700;
-            color: #61666d;
+            color: var(--bce-text-2);
             text-align: left;
         }
-
-        .chart-container {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-
-        .chart-bar-row {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-size: 11px;
-        }
-
+        .chart-container { display: flex; flex-direction: column; gap: 8px; }
+        .chart-bar-row { display: flex; align-items: center; gap: 10px; font-size: 11px; }
         .chart-bar-label {
             width: 55px;
             text-overflow: ellipsis;
@@ -906,56 +1124,28 @@
             white-space: nowrap;
             text-align: left;
             font-weight: 600;
+            color: var(--bce-text-1);
         }
-
         .chart-bar-bg {
             flex-grow: 1;
-            background: rgba(0, 0, 0, 0.04);
+            background: var(--bce-fill-1);
             height: 12px;
             border-radius: 6px;
             overflow: hidden;
             position: relative;
         }
-
         .chart-bar-fill {
-            background: linear-gradient(90deg, var(--bili-pink), #ff9eb6);
+            background: linear-gradient(90deg, var(--bce-accent), #ff9eb6);
             height: 100%;
             border-radius: 6px;
             width: 0%;
             transition: width 0.5s ease-out;
         }
-
-        .chart-bar-val {
-            width: 80px;
-            text-align: right;
-            font-weight: 700;
-            color: #61666d;
-        }
-
-        .chart-section-row {
-            display: flex;
-            gap: 10px;
-        }
-
-        .chart-section-row .chart-section.half {
-            flex: 1;
-            width: 50%;
-        }
-
-        .level-stats-container {
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-            width: 100%;
-        }
-
-        .level-row {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 11px;
-        }
-
+        .chart-bar-val { width: 80px; text-align: right; font-weight: 700; color: var(--bce-text-2); }
+        .chart-section-row { display: flex; gap: 10px; }
+        .chart-section-row .chart-section.half { flex: 1; width: 50%; }
+        .level-stats-container { display: flex; flex-direction: column; gap: 5px; width: 100%; }
+        .level-row { display: flex; align-items: center; gap: 8px; font-size: 11px; }
         .level-label {
             width: 32px;
             font-size: 9px;
@@ -971,35 +1161,21 @@
         .level-label.lv4 { background: #ff8e29; }
         .level-label.lv5 { background: #ee6363; }
         .level-label.lv6 { background: #ff0000; }
-
         .level-bar-bg {
             flex-grow: 1;
-            background: rgba(0, 0, 0, 0.04);
+            background: var(--bce-fill-1);
             height: 8px;
             border-radius: 4px;
             overflow: hidden;
         }
-
-        .level-bar-fill {
-            height: 100%;
-            border-radius: 4px;
-            transition: width 0.5s ease-out;
-        }
+        .level-bar-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease-out; }
         .level-bar-fill.lv1 { background: #95ddb2; }
         .level-bar-fill.lv2 { background: #92d1e5; }
         .level-bar-fill.lv3 { background: #ffb37c; }
         .level-bar-fill.lv4 { background: #ff8e29; }
         .level-bar-fill.lv5 { background: #ee6363; }
         .level-bar-fill.lv6 { background: #ff0000; }
-
-        .level-val {
-            width: 58px;
-            text-align: right;
-            font-weight: 700;
-            color: #61666d;
-            white-space: nowrap;
-        }
-
+        .level-val { width: 58px; text-align: right; font-weight: 700; color: var(--bce-text-2); white-space: nowrap; }
         .gender-stats-container {
             display: flex;
             justify-content: space-around;
@@ -1008,7 +1184,6 @@
             padding: 8px 0;
             width: 100%;
         }
-
         .gender-item {
             display: flex;
             flex-direction: column;
@@ -1017,68 +1192,47 @@
             font-size: 11px;
             font-weight: 600;
         }
-
-        .gender-item.male { color: var(--bili-blue); }
-        .gender-item.female { color: var(--bili-pink); }
-        .gender-item.secret { color: var(--text-sub); }
-
-        .gender-item .g-svg {
-            stroke: currentColor;
-            display: block;
-        }
-
-        .gender-item .g-label {
-            font-size: 11px;
-            font-weight: 700;
-        }
-
-        .gender-item .g-pct {
-            font-size: 13px;
-            font-weight: 800;
-        }
-
-        .gender-item .g-count {
-            font-size: 9px;
-            color: var(--text-sub);
-        }
-
-        /* Drag handle on header */
-        .bili-cmt-header {
-            cursor: grab;
-        }
-        .bili-cmt-header:active {
-            cursor: grabbing;
-        }
-
-        /* Duration badge */
+        .gender-item.male { color: var(--bce-blue); }
+        .gender-item.female { color: var(--bce-accent); }
+        .gender-item.secret { color: var(--bce-text-3); }
+        .gender-item .g-svg { stroke: currentColor; display: block; }
+        .gender-item .g-label { font-size: 11px; font-weight: 700; }
+        .gender-item .g-pct { font-size: 13px; font-weight: 800; }
+        .gender-item .g-count { font-size: 9px; color: var(--bce-text-3); }
         .dash-duration {
-            font-size: 11px;
-            color: var(--text-sub);
+            font-size: 12px;
+            color: var(--bce-text-2);
             font-weight: 600;
             text-align: center;
-            padding: 4px 0;
+            padding: 8px 10px;
+            background: var(--bce-accent-soft);
+            border-radius: 10px;
         }
-        .dash-duration span {
-            color: var(--bili-pink);
-            font-weight: 700;
-        }
+        .dash-duration span { color: var(--bce-accent); font-weight: 800; }
+        .dashboard-footer { margin-top: 2px; }
     `;
 
     // ==========================================
     // 6. CSV Export Utility
     // ==========================================
+    // 以 = + - @ 或制表符/回车开头的字段会被 Excel/WPS 当作公式执行，加前缀单引号阻断
+    const CSV_FORMULA_PREFIX = /^[=+\-@\t\r]/;
+
     function escapeCSVField(field) {
         if (field === null || field === undefined) {
             return '""';
         }
         let str = field.toString();
+        if (CSV_FORMULA_PREFIX.test(str)) {
+            str = "'" + str;
+        }
         str = str.replace(/"/g, '""'); // Double quotes escaping
         return `"${str}"`;
     }
 
     function downloadCSV(comments, filename) {
         if (comments.length === 0) {
-            alert("没有可导出的评论数据。");
+            toast('没有可导出的评论数据', 'error');
             return;
         }
 
@@ -1128,42 +1282,50 @@
     // ==========================================
     // 7. Parsing Inputs
     // ==========================================
+    // BV 号为固定 12 位、正文使用 base58 字符集（不含 0 / I / O / l）
+    const BVID_PATTERN = /^BV1[1-9A-HJ-NP-Za-km-z]{9}$/;
+
+    /**
+     * 校验并规范化 BV 号。只把前缀 bv 规范成 BV——BV 号正文大小写敏感，不能整体转换。
+     * 非法输入返回 null，避免把无效字符传给 bvid2avid 后静默算出错误的 avid。
+     */
+    function normalizeBvid(raw) {
+        if (typeof raw !== 'string') return null;
+        const s = raw.trim();
+        if (!s) return null;
+        const candidate = /^bv/i.test(s) ? 'BV' + s.slice(2) : s;
+        return BVID_PATTERN.test(candidate) ? candidate : null;
+    }
+
     function parseOidInput(input) {
         input = input.trim();
         if (!input) return null;
 
-        // Check if video link
-        const bvMatch = input.match(/video\/(BV[a-zA-Z0-9]{10})/i);
-        const avMatch = input.match(/video\/av(\d+)/i);
+        // 视频链接
+        const bvMatch = input.match(/video\/(bv[0-9a-z]{10})/i);
         if (bvMatch) {
-            const bvid = bvMatch[1];
+            const bvid = normalizeBvid(bvMatch[1]);
+            return bvid ? { oid: bvid2avid(bvid).toString(), bvid: bvid } : null;
+        }
+        const avMatch = input.match(/video\/av(\d+)/i);
+        if (avMatch) {
+            return { oid: avMatch[1], bvid: avid2bvid(BigInt(avMatch[1])) };
+        }
+
+        // 直接输入 BV 号
+        const bvid = normalizeBvid(input);
+        if (bvid) {
             return { oid: bvid2avid(bvid).toString(), bvid: bvid };
         }
-        if (avMatch) {
-            const avid = avMatch[1];
-            return { oid: avid, bvid: avid2bvid(BigInt(avid)) };
+
+        // 直接输入 AV 号
+        const avRaw = input.match(/^av(\d+)$/i);
+        if (avRaw && avRaw[1].length <= 18) {
+            return { oid: avRaw[1], bvid: avid2bvid(BigInt(avRaw[1])) };
         }
 
-        // Check raw BV ID
-        if (input.toLowerCase().startsWith('bv')) {
-            const bvid = input.slice(0, 12);
-            try {
-                return { oid: bvid2avid(bvid).toString(), bvid: bvid };
-            } catch (e) {
-                return null;
-            }
-        }
-
-        // Check raw AV ID
-        if (input.toLowerCase().startsWith('av')) {
-            const avid = input.slice(2);
-            if (/^\d+$/.test(avid)) {
-                return { oid: avid, bvid: avid2bvid(BigInt(avid)) };
-            }
-        }
-
-        // Check raw number (AVID)
-        if (/^\d+$/.test(input)) {
+        // 纯数字按 AV 号处理
+        if (/^\d{1,18}$/.test(input)) {
             return { oid: input, bvid: avid2bvid(BigInt(input)) };
         }
 
@@ -1188,18 +1350,25 @@
         return null;
     }
 
+    /** 统一把表单里的数字输入收敛到安全范围，避免负延时 / 超大页数直接打到接口 */
+    function clampInt(value, min, max, fallback) {
+        const n = parseInt(value, 10);
+        if (!Number.isFinite(n)) return fallback;
+        return Math.min(max, Math.max(min, n));
+    }
+
     function getPageContext() {
         const url = window.location.href;
         let bvid = '';
         let avid = '';
         let mid = '';
 
-        const bvMatch = url.match(/video\/(BV[a-zA-Z0-9]{10})/i);
+        const bvMatch = url.match(/video\/(bv[0-9a-z]{10})/i);
         const avMatch = url.match(/video\/av(\d+)/i);
         const spaceMatch = url.match(/space\.bilibili\.com\/(\d+)/i);
 
         if (bvMatch) {
-            bvid = bvMatch[1];
+            bvid = normalizeBvid(bvMatch[1]) || '';
         } else if (avMatch) {
             avid = avMatch[1];
             bvid = avid2bvid(BigInt(avid));
@@ -1247,32 +1416,43 @@
     let isExporting = false;
     let shouldCancel = false;
     let exportStartTime = 0;
-    const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
     const LOG_MAX_LINES = 200;
 
     let currentExportedComments = [];
     let currentFilename = "";
+    let exportController = null;   // 当前导出的 AbortController
 
-    // Throttled progress DOM update (max once per 500ms)
+    // Throttled progress DOM update (max once per 400ms)
     let lastProgressUpdate = 0;
-    function throttledProgressUpdate(stats, totalCount) {
+    function throttledProgressUpdate(stats, expected, force = false) {
         const now = Date.now();
-        if (now - lastProgressUpdate < 500) return;
+        if (!force && now - lastProgressUpdate < 400) return;
         lastProgressUpdate = now;
 
-        const totalFetched = stats.main + stats.sub;
+        const fetched = stats.main + stats.sub;
         const mainEl = document.getElementById('stats-main');
         const subEl = document.getElementById('stats-sub');
         const speedEl = document.getElementById('progress-speed');
         const barEl = document.getElementById('progress-bar-fill');
+        const pctEl = document.getElementById('progress-percent');
 
         if (mainEl) mainEl.innerText = stats.main;
         if (subEl) subEl.innerText = stats.sub;
-        if (speedEl) speedEl.innerText = `进度: ${totalFetched} / ${totalCount}`;
 
-        if (barEl) {
-            const pct = totalCount > 0 ? Math.min(100, Math.round((totalFetched / totalCount) * 100)) : 50;
-            barEl.style.width = `${pct}%`;
+        // expected 为 0 表示没有可靠分母（例如不抓楼中楼，而 all_count 含子评论），
+        // 此时不显示百分比，避免进度条永远到不了 100% 的误导
+        if (expected > 0) {
+            const pct = Math.min(99, Math.round((fetched / expected) * 100));
+            if (speedEl) speedEl.innerText = `已抓取 ${fetched} / 约 ${expected} 条`;
+            if (pctEl) pctEl.innerText = `${pct}%`;
+            if (barEl) {
+                barEl.classList.remove('indeterminate');
+                barEl.style.width = `${pct}%`;
+            }
+        } else {
+            if (speedEl) speedEl.innerText = `已抓取 ${fetched} 条`;
+            if (pctEl) pctEl.innerText = '—';
+            if (barEl) barEl.classList.add('indeterminate');
         }
     }
 
@@ -1289,6 +1469,20 @@
             consoleDiv.removeChild(consoleDiv.firstChild);
         }
         consoleDiv.scrollTop = consoleDiv.scrollHeight;
+    }
+
+    // 错误码语义映射（依据 bilibili-API-collect 文档 comment/list.md 与 misc/sign/wbi.md）
+    function describeApiError(code, message) {
+        switch (code) {
+            case 12002: return '该评论区已关闭';
+            case 12009: return '评论区 type 参数不合法';
+            case -101: return '账号未登录';
+            case -352: return '触发 B 站风控 (-352)，请稍后再试或增大请求间隔';
+            case -403: return 'Wbi 签名校验失败 (-403)';
+            case -404: return '目标不存在或已被删除 (-404)';
+            case -412: return '请求被拦截 (-412)，触发风控，请稍后再试';
+            default: return (message && message !== '0') ? message : `code ${code}`;
+        }
     }
 
     function createEmptyStats() {
@@ -1347,126 +1541,157 @@
         }
     }
 
-    async function exportVideoComments(oid, bvid, mode, includeSub, limit, requestDelay, options = {}) {
-        const { stopOnLimit = true, wbiKeys = null } = options;
-        let allComments = [];
-        let rpidMap = new Set();
-        let stats = createEmptyStats();
-
-        let imgKey, subKey;
-        try {
-            log('正在解析 Wbi Key...', 'info');
-            const keys = await getCachedWbiKeys();
-            imgKey = keys.imgKey;
-            subKey = keys.subKey;
-            log('Wbi Key 解析成功。', 'success');
-        } catch (e) {
-            log(`获取 Wbi Key 失败: ${e.message}，将直接请求可能受限的 API。`, 'warn');
+    /** 把单次视频导出的统计数据合并进批量统计 */
+    function mergeStats(target, source) {
+        target.main += source.main;
+        target.sub += source.sub;
+        for (const loc in source.ip) {
+            target.ip[loc] = (target.ip[loc] || 0) + source.ip[loc];
         }
+        for (let lvl = 1; lvl <= 6; lvl++) {
+            target.level[lvl] += source.level[lvl];
+        }
+        for (const s in source.sex) {
+            target.sex[s] += source.sex[s];
+        }
+    }
+
+    function setProgressTitle(text) {
+        const el = document.getElementById('progress-title');
+        if (el) el.innerText = text;
+    }
+
+    async function exportVideoComments(oid, bvid, mode, includeSub, limit, requestDelay, options = {}) {
+        const signal = options.signal || null;
+        const allComments = [];
+        const rpidMap = new Set();     // rpid 本身是数字，用 Set<number> 省掉每条两次字符串转换
+        const stats = createEmptyStats();
+        const failedFloors = [];       // 子评论未完整抓取的楼层 rpid
+
+        const cancelled = () => shouldCancel || !!(signal && signal.aborted);
+
+        const pushComment = (item, isSub) => {
+            const rpid = Number(item.rpid);
+            if (!rpid || rpidMap.has(rpid)) return false;
+            rpidMap.add(rpid);
+            const mapped = mapReplyItem(item, bvid);
+            allComments.push(mapped);
+            if (isSub) stats.sub++; else stats.main++;
+            updateStats(stats, mapped);
+            return true;
+        };
 
         let paginationStr = '';
         let round = 0;
-        let totalCount = 0;
+        let expected = 0;
         let mainCountFetched = 0;
         let maxTryCount = 0;
+        let completed = false;
 
-        while (isExporting && !shouldCancel) {
+        while (!cancelled()) {
             round++;
             log(`正在抓取视频 ${bvid} 的主评论第 ${round} 页...`, 'info');
 
-            let cmtInfo;
+            let page;
             try {
-                cmtInfo = await fetchCommentsPage(oid, mode, paginationStr, imgKey, subKey);
+                page = await fetchCommentsPage(oid, mode, paginationStr, signal);
             } catch (e) {
-                log(`请求第 ${round} 页主评论异常: ${e.message}`, 'error');
-                break;
-            }
-
-            if (!cmtInfo || cmtInfo.code !== 0) {
-                const msg = cmtInfo ? cmtInfo.message : '空响应';
-                log(`抓取主评论失败: ${msg}`, 'error');
+                if (isAbortError(e) || cancelled()) break;
+                log(`请求第 ${round} 页主评论失败：${e.message}`, 'error');
                 break;
             }
 
             if (round === 1) {
-                totalCount = cmtInfo.data.cursor.all_count || 0;
-                log(`该视频总计约 ${totalCount} 条评论（包含子评论）。`, 'info');
-                updateProgressUI(stats, totalCount);
+                // all_count 含子评论：只有抓取楼中楼时才是有效的进度分母，
+                // 否则强行使用会让进度条永远停在某个百分比
+                if (includeSub) {
+                    expected = page.cursor.all_count || 0;
+                    log(`该视频评论区约 ${expected} 条（含楼中楼）。`, 'info');
+                } else {
+                    log('未勾选楼中楼：接口只提供含子评论的总数，进度以已抓取条数显示。', 'info');
+                }
+                throttledProgressUpdate(stats, expected, true);
             }
 
-            const replies = cmtInfo.data.replies || [];
-            const topReplies = cmtInfo.data.top_replies || [];
+            const replies = Array.isArray(page.replies) ? page.replies : [];
+            let currentReplies = replies.slice();
 
-            let currentReplies = [...replies];
-            if (round === 1 && topReplies.length > 0) {
-                currentReplies = [...topReplies, ...currentReplies];
+            if (round === 1) {
+                // 置顶评论可能出现在 top_replies（数组）或 top.admin/upper/vote 中，合并后由 rpid 去重兜底
+                const pinned = [];
+                if (Array.isArray(page.top_replies)) {
+                    for (const item of page.top_replies) pinned.push(item);
+                }
+                const top = page.top;
+                if (top) {
+                    ['admin', 'upper', 'vote'].forEach(key => {
+                        if (top[key] && top[key].rpid) pinned.push(top[key]);
+                    });
+                }
+                if (pinned.length > 0) currentReplies = pinned.concat(currentReplies);
             }
 
             if (currentReplies.length === 0) {
-                log(`本页未获取到评论，抓取结束。`, 'info');
+                log('本页未获取到评论，抓取结束。', 'info');
+                completed = true;
                 break;
             }
 
-            paginationStr = cmtInfo.data.cursor.pagination_reply ? cmtInfo.data.cursor.pagination_reply.next_offset : '';
+            const cursor = page.cursor || {};
+            paginationStr = cursor.pagination_reply ? cursor.pagination_reply.next_offset : '';
 
-            // Process comments
             let hasNewComments = false;
-            for (const reply of currentReplies) {
-                if (shouldCancel) break;
+            let limitReached = false;
 
-                if (rpidMap.has(String(reply.rpid))) continue;
-                rpidMap.add(String(reply.rpid));
+            for (const reply of currentReplies) {
+                if (cancelled()) break;
+
+                if (!pushComment(reply, false)) continue;
                 hasNewComments = true;
 
-                const mainCmt = mapReplyItem(reply, bvid);
-                allComments.push(mainCmt);
-                stats.main++;
-                updateStats(stats, mainCmt);
-
-                // Fetch Subcomments (Floor replies)
+                // 抓取楼中楼
                 if (includeSub && reply.rcount > 0) {
-                    if (reply.replies && reply.replies.length > 0 && reply.replies.length === reply.rcount) {
-                        for (const subReply of reply.replies) {
-                            if (rpidMap.has(String(subReply.rpid))) continue;
-                            rpidMap.add(String(subReply.rpid));
+                    const previewReplies = Array.isArray(reply.replies) ? reply.replies : [];
 
-                            const subCmt = mapReplyItem(subReply, bvid);
-                            allComments.push(subCmt);
-                            stats.sub++;
-                            updateStats(stats, subCmt);
-                        }
+                    if (previewReplies.length > 0 && previewReplies.length >= reply.rcount) {
+                        // 主评论接口已内联返回全部子评论，无需再发请求
+                        for (const subReply of previewReplies) pushComment(subReply, true);
                     } else {
                         let subPage = 1;
-                        while (isExporting && !shouldCancel) {
+                        let subTotalPages = 0;   // 0 表示未知，回退到「满页」判断
+
+                        while (!cancelled()) {
                             if (subPage === 1 || subPage % 5 === 0) {
                                 log(`  正在抓取主评论 ${reply.rpid} 的子评论第 ${subPage} 页...`, 'info');
                             }
-                            await delay(requestDelay);
+                            await sleep(requestDelay, signal);
+                            if (cancelled()) break;
 
-                            let subInfo;
+                            let subData;
                             try {
-                                subInfo = await fetchSubCommentsPage(oid, reply.rpid, subPage);
+                                subData = await fetchSubCommentsPage(oid, reply.rpid, subPage, signal);
                             } catch (e) {
-                                log(`  子评论抓取异常: ${e.message}`, 'error');
+                                if (isAbortError(e) || cancelled()) break;
+                                failedFloors.push(String(reply.rpid));
+                                log(`  主评论 ${reply.rpid} 的子评论第 ${subPage} 页抓取失败：${e.message}`, 'error');
                                 break;
                             }
 
-                            if (!subInfo || subInfo.code !== 0) break;
-
-                            const subReplies = subInfo.data.replies || [];
+                            const subReplies = Array.isArray(subData.replies) ? subData.replies : [];
                             if (subReplies.length === 0) break;
 
-                            for (const subReply of subReplies) {
-                                if (rpidMap.has(String(subReply.rpid))) continue;
-                                rpidMap.add(String(subReply.rpid));
+                            for (const subReply of subReplies) pushComment(subReply, true);
 
-                                const subCmt = mapReplyItem(subReply, bvid);
-                                allComments.push(subCmt);
-                                stats.sub++;
-                                updateStats(stats, subCmt);
+                            // 文档：data.page.count 为二级评论总数，用它算总页数比「返回不足 20 条」更可靠
+                            if (!subTotalPages) {
+                                const count = subData.page && subData.page.count;
+                                if (count > 0) subTotalPages = Math.ceil(count / 20);
                             }
-
-                            if (subReplies.length < 20) break;
+                            if (subTotalPages) {
+                                if (subPage >= subTotalPages) break;
+                            } else if (subReplies.length < 20) {
+                                break;
+                            }
                             subPage++;
                         }
                     }
@@ -1474,134 +1699,146 @@
 
                 mainCountFetched++;
                 if (limit && mainCountFetched >= limit) {
-                    log(`已达到设定的主评论获取上限 (${limit}条)。`, 'warn');
-                    if (stopOnLimit) shouldCancel = true;
+                    log(`已达到设定的主评论获取上限 (${limit} 条)。`, 'warn');
+                    limitReached = true;
                     break;
                 }
             }
 
-            if (!hasNewComments && currentReplies.length > 0) {
+            if (limitReached) {
+                log('已按设定上限停止抓取，准备保存数据。', 'success');
+                completed = true;
+                break;
+            }
+            if (cancelled()) break;
+
+            if (!hasNewComments) {
                 maxTryCount++;
                 log(`本页获取到的全部评论皆为重复数据 (第 ${maxTryCount} 次)...`, 'warn');
                 if (maxTryCount >= 5) {
-                    log(`连续 5 次获取到重复数据，停止抓取，防止陷入死循环。`, 'warn');
+                    log('连续 5 次获取到重复数据，停止抓取，防止陷入死循环。', 'warn');
                     break;
                 }
             } else {
                 maxTryCount = 0;
             }
 
-            // Update progress (throttled)
-            throttledProgressUpdate(stats, totalCount);
+            throttledProgressUpdate(stats, expected);
 
-            if (shouldCancel) break;
-
-            await delay(requestDelay);
-
-            if (!paginationStr || (cmtInfo.data.cursor && cmtInfo.data.cursor.is_end)) {
+            if (!paginationStr || cursor.is_end) {
                 log('已到达主评论底部。', 'success');
+                completed = true;
                 break;
             }
+
+            await sleep(requestDelay, signal);
         }
 
-        return { allComments, stats };
+        if (!completed && cancelled()) {
+            log(`导出已中断：已抓取 ${stats.main} 条主评论 / ${stats.sub} 条楼中楼。`, 'warn');
+        }
+        if (failedFloors.length > 0) {
+            log(`有 ${failedFloors.length} 个楼层的子评论未完整抓取（rpid: ${failedFloors.slice(0, 5).join(', ')}${failedFloors.length > 5 ? ' ...' : ''}）。`, 'warn');
+        }
+
+        return { allComments, stats, completed, failedFloors };
     }
 
-    async function exportUpComments(mid, upPages, skipPages, includeSub, limitPerVideo, requestDelay) {
-        let imgKey, subKey;
-        try {
-            log('正在解析 Wbi Key...', 'info');
-            const keys = await getCachedWbiKeys();
-            imgKey = keys.imgKey;
-            subKey = keys.subKey;
-            log('Wbi Key 解析成功。', 'success');
-        } catch (e) {
-            log(`获取 Wbi Key 失败: ${e.message}。将直接请求可能受限的 API。`, 'warn');
-        }
+    async function exportUpComments(mid, upPages, skipPages, includeSub, limitPerVideo, requestDelay, options = {}) {
+        const signal = options.signal || null;
+        const cancelled = () => shouldCancel || !!(signal && signal.aborted);
 
         const videos = [];
+        const seenBvid = new Set();   // 翻页期间 UP 发新稿会导致偏移重复，按 bvid 去重
         const orderSelect = document.querySelector('input[name="up-order"]:checked');
         const order = orderSelect ? orderSelect.value : 'pubdate';
 
         const startPage = skipPages + 1;
         const endPage = skipPages + upPages;
+        let totalVideoCount = 0;
 
         for (let pageNum = startPage; pageNum <= endPage; pageNum++) {
-            if (shouldCancel) break;
+            if (cancelled()) break;
             log(`正在抓取 UP主 投稿列表第 ${pageNum} 页...`, 'info');
 
-            let listInfo;
+            let data;
             try {
-                listInfo = await fetchUpVideosPage(mid, pageNum, order, imgKey, subKey);
-            } catch(e) {
-                log(`请求投稿列表第 ${pageNum} 页异常: ${e.message}`, 'error');
+                data = await fetchUpVideosPage(mid, pageNum, order, signal);
+            } catch (e) {
+                if (isAbortError(e) || cancelled()) break;
+                log(`请求投稿列表第 ${pageNum} 页失败：${e.message}`, 'error');
                 break;
             }
 
-            if (!listInfo || listInfo.code !== 0) {
-                const msg = listInfo ? listInfo.message : '空响应';
-                log(`抓取投稿列表失败: ${msg}`, 'error');
+            // 文档：data.is_risk / gaia_res_type 表示被风控，此时 vlist 为空，
+            // 不能当成「没有更多稿件」而静默截断
+            if (data.is_risk) {
+                log('投稿列表触发风控 (is_risk)，已停止翻页，请稍后再试或降低请求频率。', 'error');
                 break;
             }
 
-            const vlist = listInfo.data && listInfo.data.list && listInfo.data.list.vlist;
-            if (!vlist || vlist.length === 0) {
-                log(`没有更多视频了。`, 'info');
+            const vlist = (data.list && Array.isArray(data.list.vlist)) ? data.list.vlist : [];
+            if (vlist.length === 0) {
+                log('没有更多视频了。', 'info');
                 break;
             }
 
-            videos.push(...vlist);
-            await delay(requestDelay);
+            let added = 0;
+            for (const video of vlist) {
+                if (!video || !video.bvid || seenBvid.has(video.bvid)) continue;
+                seenBvid.add(video.bvid);
+                videos.push(video);
+                added++;
+            }
+            log(`第 ${pageNum} 页解析到 ${added} 个新视频。`, 'info');
+
+            if (data.page && data.page.count) totalVideoCount = data.page.count;
+            if (totalVideoCount && videos.length >= totalVideoCount) {
+                log('已抓取全部投稿视频。', 'success');
+                break;
+            }
+            if (pageNum < endPage) await sleep(requestDelay, signal);
         }
 
         log(`共成功获取到 ${videos.length} 个视频。准备启动批量导出评论...`, 'success');
 
-        let allComments = [];
-        let stats = createEmptyStats();
-
+        const allComments = [];
+        const stats = createEmptyStats();
         const totalVideos = videos.length;
+
         for (let i = 0; i < totalVideos; i++) {
-            if (shouldCancel) break;
+            if (cancelled()) break;
             const video = videos[i];
-            log(`========================================`, 'info');
-            log(`[视频 ${i+1}/${totalVideos}] 正在导出: ${video.title} (BVID: ${video.bvid})`, 'info');
+            log('========================================', 'info');
+            log(`[视频 ${i + 1}/${totalVideos}] 正在导出: ${video.title} (BVID: ${video.bvid})`, 'info');
+            setProgressTitle(`UP 主批量导出中 · 第 ${i + 1}/${totalVideos} 个视频`);
 
             try {
-                const exportOpts = { stopOnLimit: false };
-                if (imgKey && subKey) exportOpts.wbiKeys = { imgKey, subKey };
                 const result = await exportVideoComments(
-                    video.aid.toString(),
+                    String(video.aid),
                     video.bvid,
-                    3, // hot order for UP list videos
+                    3, // 投稿列表按热度排序抓评论
                     includeSub,
                     limitPerVideo,
                     requestDelay,
-                    exportOpts
+                    { signal }
                 );
 
-                allComments.push(...result.allComments);
-                stats.main += result.stats.main;
-                stats.sub += result.stats.sub;
-
-                // Merge stats
-                for (const loc in result.stats.ip) {
-                    stats.ip[loc] = (stats.ip[loc] || 0) + result.stats.ip[loc];
-                }
-                for (let lvl = 1; lvl <= 6; lvl++) {
-                    stats.level[lvl] += result.stats.level[lvl];
-                }
-                for (const s in result.stats.sex) {
-                    stats.sex[s] += result.stats.sex[s];
-                }
+                // 逐个 push：直接 push(...arr) 在评论数上万时会触发 V8 参数上限（RangeError）
+                for (const cmt of result.allComments) allComments.push(cmt);
+                mergeStats(stats, result.stats);
 
             } catch (e) {
-                log(`视频 ${video.bvid} 导出失败: ${e.message}`, 'error');
+                if (isAbortError(e) || cancelled()) break;
+                log(`视频 ${video.bvid} 导出失败：${e.message}`, 'error');
             }
 
-            await delay(requestDelay * 2);
+            if (i < totalVideos - 1 && !cancelled()) {
+                await sleep(requestDelay * 2, signal);
+            }
         }
 
-        return { allComments, stats };
+        return { allComments, stats, completed: !cancelled() };
     }
 
     // ==========================================
@@ -1618,17 +1855,17 @@
     function sendDesktopNotification(title, body) {
         if (!('Notification' in window)) return;
         if (Notification.permission === 'granted') {
-            new Notification(title, { body, icon: 'https://github.com/heroxv/bilibili-comment-exporter/raw/main/assets/logo.svg' });
+            new Notification(title, { body, icon: 'https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/assets/logo.svg' });
         } else if (Notification.permission !== 'denied') {
             Notification.requestPermission().then(perm => {
                 if (perm === 'granted') {
-                    new Notification(title, { body, icon: 'https://github.com/heroxv/bilibili-comment-exporter/raw/main/assets/logo.svg' });
+                    new Notification(title, { body, icon: 'https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/assets/logo.svg' });
                 }
             });
         }
     }
 
-    function displayStats(comments, stats, filename) {
+    function displayStats(comments, stats, filename, incomplete = false) {
         currentExportedComments = comments;
         currentFilename = filename;
 
@@ -1646,12 +1883,16 @@
         const durationRow = document.getElementById('dash-duration-row');
         if (durationRow && exportStartTime > 0) {
             const elapsed = Date.now() - exportStartTime;
-            durationRow.innerHTML = `✅ 导出完成，耗时 <span>${formatDuration(elapsed)}</span>，共 ${total} 条评论`;
+            const prefix = incomplete ? '⚠️ 导出已中断' : '✅ 导出完成';
+            durationRow.innerHTML = `${prefix}，耗时 <span>${formatDuration(elapsed)}</span>，共 ${total} 条评论`;
             durationRow.style.display = 'block';
         }
 
         // Desktop notification
-        sendDesktopNotification('bilibili-comment-exporter', `导出完成！共 ${total} 条评论。`);
+        sendDesktopNotification(
+            'bilibili-comment-exporter',
+            incomplete ? `导出已中断，已保存 ${total} 条评论。` : `导出完成！共 ${total} 条评论。`
+        );
 
         // Render IP locations Top 5
         const ipContainer = document.getElementById('chart-ip');
@@ -1664,7 +1905,7 @@
         const maxCount = topIps.length > 0 ? topIps[0].count : 1;
 
         if (topIps.length === 0) {
-            ipContainer.innerHTML = '<div style="font-size:12px;color:var(--text-sub);text-align:center;padding:10px 0;">无 IP 地理位置数据</div>';
+            ipContainer.innerHTML = '<div style="font-size:12px;color:var(--bce-text-2);text-align:center;padding:10px 0;">无 IP 地理位置数据（未登录时不返回该字段）</div>';
         } else {
             topIps.forEach(item => {
                 const pct = Math.round((item.count / total) * 100);
@@ -1748,377 +1989,656 @@
     // ==========================================
     // 10. UI Generation & Control
     // ==========================================
-    function createUI() {
-        if (document.getElementById('bili-cmt-float-btn')) return;
+    const SCRIPT_VERSION = '0.4.0';
+    const ENTRY_BTN_ID = 'bili-cmt-entry';
+    const SETTINGS_KEY = 'biliCmtExporter.settings.v1';
 
-        // Inject Styles
-        const style = document.createElement('style');
-        style.innerText = CSS_STYLES;
-        document.head.appendChild(style);
+    const ENTRY_ICON_SVG = '<svg viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" clip-rule="evenodd" d="M7.75 4.5H20.25A4.75 4.75 0 0 1 25 9.25V14.25A4.75 4.75 0 0 1 20.25 19H10.4L5.35 23.55C4.72 24.12 3.75 23.67 3.75 22.82V9.25A4.75 4.75 0 0 1 7.75 4.5ZM13.1 8.5h1.8v4.4l2.5-2.5 1.3 1.3-4.7 4.7-4.7-4.7 1.3-1.3 2.5 2.5V8.5Z"></path></svg>';
+    const CLOSE_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg>';
+    const DOWNLOAD_ICON_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>';
 
-        // Floating Button
-        const floatBtn = document.createElement('div');
-        floatBtn.id = 'bili-cmt-float-btn';
-        floatBtn.className = 'bili-cmt-float-btn';
-        floatBtn.innerHTML = `
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-                <polyline points="10 9 14 9 14 13"></polyline>
-                <line x1="9" y1="13" x2="14" y2="8"></line>
-            </svg>
-            <span>导出评论</span>
-        `;
-        document.body.appendChild(floatBtn);
+    const VIDEO_ENTRY_HOSTS = [
+        '.video-toolbar-container-main .video-toolbar-left-main',
+        '.video-toolbar-container .video-toolbar-left-main',
+        '.video-toolbar-left-main',
+        '.video-toolbar-left',
+        '.video-toolbar'
+    ];
 
-        // Control Panel
+    const SPACE_ENTRY_HOSTS = [
+        { selector: '.interactions', variant: 'overlay' },
+        { selector: '.h-action', variant: 'legacy' },
+        { selector: '.upinfo-btn-panel', variant: 'legacy' }
+    ];
+
+    // ---------- Toast 通知 ----------
+    function toast(message, type = 'info', duration = 3200) {
+        const box = document.getElementById('bili-cmt-toast-container');
+        if (!box) return;
+        const icons = {
+            success: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>',
+            error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="9"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>',
+            info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="9"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>'
+        };
+        const el = document.createElement('div');
+        el.className = 'bili-cmt-toast ' + type;
+        el.innerHTML = (icons[type] || icons.info) + '<span></span>';
+        el.querySelector('span').textContent = message;
+        box.appendChild(el);
+        while (box.children.length > 4) {
+            box.removeChild(box.firstChild);
+        }
+        setTimeout(() => {
+            el.classList.add('out');
+            setTimeout(() => el.remove(), 240);
+        }, duration);
+    }
+
+    function flagInvalid(inputEl, message) {
+        toast(message, 'error');
+        if (inputEl) {
+            inputEl.classList.remove('bili-cmt-shake');
+            void inputEl.offsetWidth;
+            inputEl.classList.add('bili-cmt-shake');
+            setTimeout(() => inputEl.classList.remove('bili-cmt-shake'), 480);
+            inputEl.focus();
+        }
+    }
+
+    // ---------- 暗色模式同步 ----------
+    function isPageDark() {
+        return !!(
+            (document.body && (document.body.classList.contains('dark') || document.body.classList.contains('bili-dark'))) ||
+            document.documentElement.classList.contains('dark') ||
+            document.documentElement.classList.contains('bili-dark') ||
+            document.querySelector('.bili-dark')
+        );
+    }
+
+    function syncDarkTheme() {
+        const dark = isPageDark();
+        const targets = [
+            document.getElementById('bili-cmt-panel'),
+            document.getElementById('bili-cmt-toast-container'),
+            document.getElementById(ENTRY_BTN_ID)
+        ];
+        targets.forEach(el => {
+            if (el) el.classList.toggle('bili-cmt-dark', dark);
+        });
+    }
+
+    function watchThemeChanges() {
+        const observer = new MutationObserver(() => {
+            try { syncDarkTheme(); } catch (e) { /* 忽略 */ }
+        });
+        observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+        if (document.body) {
+            observer.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+        }
+    }
+
+    // ---------- 设置持久化 ----------
+    function loadSavedSettings() {
+        try {
+            return JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') || {};
+        } catch (e) {
+            return {};
+        }
+    }
+
+    function setRadio(name, value) {
+        const el = document.querySelector('input[name="' + name + '"][value="' + value + '"]');
+        if (el) el.checked = true;
+    }
+
+    function persistSettings() {
+        const orderEl = document.querySelector('input[name="video-order"]:checked');
+        const upOrderEl = document.querySelector('input[name="up-order"]:checked');
+        const data = {
+            videoOrder: orderEl ? orderEl.value : '3',
+            includeSub: document.getElementById('video-subcomments').checked,
+            videoDelay: document.getElementById('video-delay').value,
+            upOrder: upOrderEl ? upOrderEl.value : 'pubdate',
+            upPages: document.getElementById('up-pages').value,
+            upSkip: document.getElementById('up-skip').value,
+            upIncludeSub: document.getElementById('up-subcomments').checked,
+            upDelay: document.getElementById('up-delay').value
+        };
+        try {
+            localStorage.setItem(SETTINGS_KEY, JSON.stringify(data));
+        } catch (e) { /* localStorage 不可用时静默降级 */ }
+    }
+
+    function restoreSettings() {
+        const s = loadSavedSettings();
+        if (s.videoOrder) setRadio('video-order', String(s.videoOrder));
+        if (typeof s.includeSub === 'boolean') document.getElementById('video-subcomments').checked = s.includeSub;
+        if (s.videoDelay) document.getElementById('video-delay').value = s.videoDelay;
+        if (s.upOrder) setRadio('up-order', String(s.upOrder));
+        if (s.upPages) document.getElementById('up-pages').value = s.upPages;
+        if (s.upSkip !== undefined && s.upSkip !== null && s.upSkip !== '') document.getElementById('up-skip').value = s.upSkip;
+        if (typeof s.upIncludeSub === 'boolean') document.getElementById('up-subcomments').checked = s.upIncludeSub;
+        if (s.upDelay) document.getElementById('up-delay').value = s.upDelay;
+    }
+
+    // ---------- 面板视图切换 ----------
+    function setView(view) {
+        const body = document.getElementById('bili-cmt-body');
+        const progress = document.getElementById('bili-cmt-progress-panel');
+        const dashboard = document.getElementById('bili-cmt-dashboard');
+        if (!body) return;
+        body.classList.toggle('bili-cmt-mode-progress', view === 'progress');
+        body.classList.toggle('bili-cmt-mode-dashboard', view === 'dashboard');
+        if (progress) progress.style.display = view === 'progress' ? 'flex' : 'none';
+        if (dashboard) dashboard.style.display = view === 'dashboard' ? 'flex' : 'none';
+    }
+
+    function startProgressUI(title) {
+        setView('progress');
+        const titleEl = document.getElementById('progress-title');
+        if (titleEl) titleEl.innerText = title;
+        const bar = document.getElementById('progress-bar-fill');
+        if (bar) {
+            bar.classList.remove('indeterminate');
+            bar.style.width = '0%';
+        }
+        const pct = document.getElementById('progress-percent');
+        if (pct) pct.innerText = '0%';
+        const speedEl = document.getElementById('progress-speed');
+        if (speedEl) speedEl.innerText = '已抓取 0 条';
+        const mainEl = document.getElementById('stats-main');
+        const subEl = document.getElementById('stats-sub');
+        if (mainEl) mainEl.innerText = '0';
+        if (subEl) subEl.innerText = '0';
+        const logBox = document.getElementById('console-log');
+        if (logBox) logBox.innerHTML = '';
+        lastProgressUpdate = 0;
+        log('准备就绪，开始导出...', 'info');
+    }
+
+    function togglePanel(open) {
+        const panel = document.getElementById('bili-cmt-panel');
+        if (!panel) return;
+        const willOpen = typeof open === 'boolean' ? open : !panel.classList.contains('bili-cmt-open');
+        if (willOpen) {
+            syncDarkTheme();
+            restoreSettings();
+            handleUrlChange();
+            if (isExporting) setView('progress');
+        }
+        panel.classList.toggle('bili-cmt-open', willOpen);
+    }
+
+    function switchTab(tabName) {
+        const tabs = document.querySelectorAll('.bili-cmt-tab');
+        const contents = document.querySelectorAll('.bili-cmt-tab-content');
+        tabs.forEach(t => {
+            t.classList.toggle('active', t.getAttribute('data-tab') === tabName);
+        });
+        contents.forEach(c => {
+            c.classList.toggle('active', c.getAttribute('id') === 'tab-' + tabName);
+        });
+    }
+
+    // ---------- 入口按钮注入 ----------
+    function buildVideoEntry() {
+        const wrap = document.createElement('div');
+        wrap.className = 'toolbar-left-item-wrap';
+        wrap.setAttribute('data-bce', 'wrap');
+        const btn = document.createElement('div');
+        btn.id = ENTRY_BTN_ID;
+        btn.className = 'bili-cmt-entry';
+        btn.setAttribute('role', 'button');
+        btn.setAttribute('tabindex', '0');
+        btn.setAttribute('aria-label', '导出当前视频评论区');
+        btn.title = '导出当前视频评论区';
+        btn.innerHTML = ENTRY_ICON_SVG + '<span>导出评论</span>';
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            togglePanel(true);
+        });
+        btn.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                togglePanel(true);
+            }
+        });
+        wrap.appendChild(btn);
+        return wrap;
+    }
+
+    function buildSpaceEntry(variant) {
+        const btn = document.createElement('div');
+        btn.id = ENTRY_BTN_ID;
+        btn.className = 'bili-cmt-entry-space' + (variant === 'legacy' ? ' bili-cmt-entry-space-legacy' : '');
+        btn.setAttribute('role', 'button');
+        btn.setAttribute('tabindex', '0');
+        btn.setAttribute('aria-label', '批量导出该 UP 主视频评论区');
+        btn.title = '批量导出该 UP 主视频评论区';
+        btn.innerHTML = ENTRY_ICON_SVG + '<span>导出评论</span>';
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            togglePanel(true);
+        });
+        return btn;
+    }
+
+    let pageLoadStamp = -1;
+    if (document.readyState === 'complete') {
+        pageLoadStamp = 0;
+    } else {
+        window.addEventListener('load', () => { pageLoadStamp = Date.now(); }, { once: true });
+    }
+
+    function entryInjectAllowed() {
+        // 必须等页面 load 完成后再向 B 站组件容器插入节点：
+        // 若在 Vue hydration 窗口期内注入，会打断其前端水合，导致顶栏、评论区等组件渲染异常。
+        if (pageLoadStamp === 0) return true;
+        if (pageLoadStamp > 0) return Date.now() - pageLoadStamp >= 1200;
+        return performance.now() >= 8000;
+    }
+
+    function tryInjectEntry() {
+        if (document.getElementById(ENTRY_BTN_ID)) return true;
+        if (!entryInjectAllowed()) return false;
+        const path = window.location.pathname;
+
+        if (/^\/video\//.test(path)) {
+            for (const sel of VIDEO_ENTRY_HOSTS) {
+                const host = document.querySelector(sel);
+                if (!host) continue;
+                host.appendChild(buildVideoEntry());
+                syncDarkTheme();
+                return true;
+            }
+        }
+
+        if (/space\.bilibili\.com$/.test(window.location.hostname)) {
+            for (const item of SPACE_ENTRY_HOSTS) {
+                const host = document.querySelector(item.selector);
+                if (!host) continue;
+                host.appendChild(buildSpaceEntry(item.variant));
+                syncDarkTheme();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function watchEntryInjection() {
+        let timer = null;
+        const schedule = () => {
+            if (timer) return;
+            timer = setTimeout(() => {
+                timer = null;
+                try {
+                    // 注入成功后 tryInjectEntry 内部已同步主题，这里不再重复查询 DOM
+                    if (!document.getElementById(ENTRY_BTN_ID)) tryInjectEntry();
+                } catch (e) { /* 忽略 */ }
+            }, 400);
+        };
+        if (document.body) {
+            new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true });
+        }
+    }
+
+    // ---------- 面板构建 ----------
+    function buildToastContainer() {
+        if (document.getElementById('bili-cmt-toast-container')) return;
+        const box = document.createElement('div');
+        box.id = 'bili-cmt-toast-container';
+        box.className = 'bili-cmt-toast-container';
+        document.body.appendChild(box);
+    }
+
+    function buildPanel() {
+        if (document.getElementById('bili-cmt-panel')) return;
+
         const panel = document.createElement('div');
         panel.id = 'bili-cmt-panel';
         panel.className = 'bili-cmt-panel';
-        panel.style.display = 'none';
+        panel.setAttribute('role', 'dialog');
+        panel.setAttribute('aria-label', 'B站评论区导出工具');
         panel.innerHTML = `
             <div class="bili-cmt-header">
                 <div class="bili-cmt-title-area">
-                    <h3>B站评论区导出工具</h3>
-                    <span class="bili-cmt-subtitle">bilibili-comment-exporter v0.2.0</span>
+                    <h3>评论区导出</h3>
+                    <span class="bili-cmt-subtitle">bilibili-comment-exporter v${SCRIPT_VERSION}</span>
                 </div>
-                <button id="bili-cmt-close-btn" class="bili-cmt-close-btn">&times;</button>
+                <button id="bili-cmt-close-btn" class="bili-cmt-icon-btn" aria-label="关闭面板">
+                    ${CLOSE_ICON_SVG}
+                </button>
             </div>
-            
-            <div class="bili-cmt-tabs">
-                <div class="bili-cmt-tab active" data-tab="video">视频导出</div>
-                <div class="bili-cmt-tab" data-tab="up">UP主批量</div>
-            </div>
-            
-            <div class="bili-cmt-tab-content active" id="tab-video">
-                <div class="bili-cmt-form-group">
-                    <label>视频 BV 号 / 链接</label>
-                    <input type="text" id="video-bvid" placeholder="例如: BV1VJ4m1jk34K 或 视频链接" />
+            <div class="bili-cmt-body" id="bili-cmt-body">
+                <div class="bili-cmt-tabs">
+                    <div class="bili-cmt-tab active" data-tab="video">视频导出</div>
+                    <div class="bili-cmt-tab" data-tab="up">UP主批量</div>
                 </div>
-                
-                <div class="bili-cmt-form-group">
-                    <label>排序方式</label>
-                    <div class="bili-cmt-segmented">
-                        <label class="bili-cmt-segment-item">
-                            <input type="radio" name="video-order" value="3" checked />
-                            <span>热度优先</span>
-                        </label>
-                        <label class="bili-cmt-segment-item">
-                            <input type="radio" name="video-order" value="2" />
-                            <span>时间优先</span>
-                        </label>
+
+                <div class="bili-cmt-tab-content active" id="tab-video">
+                    <div class="bili-cmt-form-group">
+                        <label>视频 BV 号 / 链接</label>
+                        <input type="text" id="video-bvid" placeholder="例如: BV1VJ4m1jk34K 或粘贴视频链接" />
                     </div>
-                </div>
-                
-                <div class="bili-cmt-form-group-row">
-                    <label class="bili-cmt-checkbox-label">
-                        <input type="checkbox" id="video-subcomments" checked />
-                        <span>包含楼中楼子评论</span>
-                    </label>
-                </div>
-                
-                <div class="bili-cmt-form-row">
-                    <div class="bili-cmt-form-group half">
-                        <label>主评论限制数量</label>
-                        <input type="number" id="video-limit" placeholder="不限" min="1" />
-                    </div>
-                    <div class="bili-cmt-form-group half">
-                        <label>请求间隔延迟 (ms)</label>
-                        <input type="number" id="video-delay" value="500" min="100" />
-                    </div>
-                </div>
-                
-                <button id="video-start-btn" class="bili-cmt-btn primary">开始导出</button>
-            </div>
-            
-            <div class="bili-cmt-tab-content" id="tab-up">
-                <div class="bili-cmt-form-group">
-                    <label>UP主 Mid / 主页链接</label>
-                    <input type="text" id="up-mid" placeholder="例如: 123344555 或 主页链接" />
-                </div>
-                
-                <div class="bili-cmt-form-group">
-                    <label>视频排序方式</label>
-                    <div class="bili-cmt-segmented">
-                        <label class="bili-cmt-segment-item">
-                            <input type="radio" name="up-order" value="pubdate" checked />
-                            <span>最新投稿</span>
-                        </label>
-                        <label class="bili-cmt-segment-item">
-                            <input type="radio" name="up-order" value="click" />
-                            <span>最多播放</span>
-                        </label>
-                        <label class="bili-cmt-segment-item">
-                            <input type="radio" name="up-order" value="stow" />
-                            <span>最多收藏</span>
-                        </label>
-                    </div>
-                </div>
-                
-                <div class="bili-cmt-form-row">
-                    <div class="bili-cmt-form-group half">
-                        <label>爬取视频页数 (30条/页)</label>
-                        <input type="number" id="up-pages" value="3" min="1" />
-                    </div>
-                    <div class="bili-cmt-form-group half">
-                        <label>跳过前几页</label>
-                        <input type="number" id="up-skip" value="0" min="0" />
-                    </div>
-                </div>
-                
-                <div class="bili-cmt-form-group-row">
-                    <label class="bili-cmt-checkbox-label">
-                        <input type="checkbox" id="up-subcomments" checked />
-                        <span>包含楼中楼子评论</span>
-                    </label>
-                </div>
-                
-                <div class="bili-cmt-form-row">
-                    <div class="bili-cmt-form-group half">
-                        <label>单视频主评论限制</label>
-                        <input type="number" id="up-video-limit" placeholder="不限" min="1" />
-                    </div>
-                    <div class="bili-cmt-form-group half">
-                        <label>请求间隔延迟 (ms)</label>
-                        <input type="number" id="up-delay" value="500" min="100" />
-                    </div>
-                </div>
-                
-                <button id="up-start-btn" class="bili-cmt-btn primary">开始批量导出</button>
-            </div>
-            
-            <!-- Progress Overlay -->
-            <div id="bili-cmt-progress-panel" class="bili-cmt-progress-panel" style="display: none;">
-                <div class="bili-cmt-progress-header">
-                    <h4 id="progress-title">正在准备导出...</h4>
-                    <span id="progress-speed">进度: 0/0</span>
-                </div>
-                
-                <div class="bili-cmt-progress-bar-container">
-                    <div id="progress-bar-fill" class="bili-cmt-progress-bar-fill" style="width: 0%;"></div>
-                </div>
-                
-                <div class="bili-cmt-stats-summary">
-                    <div>已抓取主评论: <span id="stats-main" class="bili-cmt-badge">0</span></div>
-                    <div>已抓取子评论: <span id="stats-sub" class="bili-cmt-badge">0</span></div>
-                </div>
-                
-                <div id="console-log" class="bili-cmt-console">
-                    <div class="log-line info">[INFO] 准备就绪，等待开始。</div>
-                </div>
-                
-                <button id="progress-cancel-btn" class="bili-cmt-btn danger">取消导出</button>
-            </div>
-            
-            <!-- Stats Dashboard -->
-            <div id="bili-cmt-dashboard" class="bili-cmt-dashboard" style="display: none;">
-                <div class="dashboard-header">
-                    <h4>📊 导出完成数据统计</h4>
-                    <button id="dashboard-back-btn" class="bili-cmt-btn-text">返回设置</button>
-                </div>
-                
-                <div id="dash-duration-row" class="dash-duration" style="display:none;"></div>
-                
-                <div class="dashboard-summary-cards">
-                    <div class="summary-card">
-                        <span class="card-num" id="dash-total">0</span>
-                        <span class="card-label">总下载评论数</span>
-                    </div>
-                    <div class="summary-card">
-                        <span class="card-num" id="dash-main">0</span>
-                        <span class="card-label">主评论</span>
-                    </div>
-                    <div class="summary-card">
-                        <span class="card-num" id="dash-sub">0</span>
-                        <span class="card-label">楼中楼评论</span>
-                    </div>
-                </div>
-                
-                <div class="dashboard-charts">
-                    <div class="chart-section">
-                        <h5>📍 IP属地分布 (Top 5)</h5>
-                        <div id="chart-ip" class="chart-container">
-                            <!-- Dynamic Bars -->
+                    <div class="bili-cmt-form-group">
+                        <label>排序方式</label>
+                        <div class="bili-cmt-segmented">
+                            <label class="bili-cmt-segment-item">
+                                <input type="radio" name="video-order" value="3" checked />
+                                <span>热度优先</span>
+                            </label>
+                            <label class="bili-cmt-segment-item">
+                                <input type="radio" name="video-order" value="2" />
+                                <span>时间优先</span>
+                            </label>
                         </div>
                     </div>
-                    <div class="chart-section-row">
-                        <div class="chart-section half">
-                            <h5>用户等级分布</h5>
-                            <div id="chart-level" class="chart-container">
-                                <!-- Level list -->
+                    <div class="bili-cmt-form-group">
+                        <label class="bili-cmt-checkbox-label">
+                            <input type="checkbox" id="video-subcomments" checked />
+                            <span>包含楼中楼子评论</span>
+                        </label>
+                    </div>
+                    <div class="bili-cmt-form-row">
+                        <div class="bili-cmt-form-group half">
+                            <label>主评论限制数量</label>
+                            <input type="number" id="video-limit" placeholder="不限" min="1" />
+                        </div>
+                        <div class="bili-cmt-form-group half">
+                            <label>请求间隔 (毫秒)</label>
+                            <input type="number" id="video-delay" value="500" min="100" />
+                        </div>
+                    </div>
+                    <button id="video-start-btn" class="bili-cmt-btn primary">${DOWNLOAD_ICON_SVG}<span>开始导出</span></button>
+                </div>
+
+                <div class="bili-cmt-tab-content" id="tab-up">
+                    <div class="bili-cmt-form-group">
+                        <label>UP主 Mid / 主页链接</label>
+                        <input type="text" id="up-mid" placeholder="例如: 123344555 或主页链接" />
+                    </div>
+                    <div class="bili-cmt-form-group">
+                        <label>视频排序方式</label>
+                        <div class="bili-cmt-segmented">
+                            <label class="bili-cmt-segment-item">
+                                <input type="radio" name="up-order" value="pubdate" checked />
+                                <span>最新投稿</span>
+                            </label>
+                            <label class="bili-cmt-segment-item">
+                                <input type="radio" name="up-order" value="click" />
+                                <span>最多播放</span>
+                            </label>
+                            <label class="bili-cmt-segment-item">
+                                <input type="radio" name="up-order" value="stow" />
+                                <span>最多收藏</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="bili-cmt-form-row">
+                        <div class="bili-cmt-form-group half">
+                            <label>爬取视频页数 (30条/页)</label>
+                            <input type="number" id="up-pages" value="3" min="1" />
+                        </div>
+                        <div class="bili-cmt-form-group half">
+                            <label>跳过前几页</label>
+                            <input type="number" id="up-skip" value="0" min="0" />
+                        </div>
+                    </div>
+                    <div class="bili-cmt-form-group">
+                        <label class="bili-cmt-checkbox-label">
+                            <input type="checkbox" id="up-subcomments" checked />
+                            <span>包含楼中楼子评论</span>
+                        </label>
+                    </div>
+                    <div class="bili-cmt-form-row">
+                        <div class="bili-cmt-form-group half">
+                            <label>单视频主评论限制</label>
+                            <input type="number" id="up-video-limit" placeholder="不限" min="1" />
+                        </div>
+                        <div class="bili-cmt-form-group half">
+                            <label>请求间隔 (毫秒)</label>
+                            <input type="number" id="up-delay" value="500" min="100" />
+                        </div>
+                    </div>
+                    <button id="up-start-btn" class="bili-cmt-btn primary">${DOWNLOAD_ICON_SVG}<span>开始批量导出</span></button>
+                </div>
+
+                <div id="bili-cmt-progress-panel" class="bili-cmt-progress-panel">
+                    <div class="bili-cmt-progress-header">
+                        <h4 id="progress-title">正在准备导出...</h4>
+                        <span id="progress-percent">0%</span>
+                    </div>
+                    <div class="bili-cmt-progress-bar-container">
+                        <div id="progress-bar-fill" class="bili-cmt-progress-bar-fill" style="width: 0%;"></div>
+                    </div>
+                    <div class="bili-cmt-stats-summary">
+                        <div>主评论: <span id="stats-main" class="bili-cmt-badge">0</span></div>
+                        <div>子评论: <span id="stats-sub" class="bili-cmt-badge">0</span></div>
+                        <div id="progress-speed">进度: 0 / 0</div>
+                    </div>
+                    <div id="console-log" class="bili-cmt-console">
+                        <div class="log-line info">[INFO] 准备就绪，等待开始。</div>
+                    </div>
+                    <button id="progress-cancel-btn" class="bili-cmt-btn danger">取消导出</button>
+                </div>
+
+                <div id="bili-cmt-dashboard" class="bili-cmt-dashboard">
+                    <div class="dashboard-header">
+                        <h4>导出完成 · 数据统计</h4>
+                        <button id="dashboard-back-btn" class="bili-cmt-btn-text">返回设置</button>
+                    </div>
+                    <div id="dash-duration-row" class="dash-duration" style="display:none;"></div>
+                    <div class="dashboard-summary-cards">
+                        <div class="summary-card">
+                            <span class="card-num" id="dash-total">0</span>
+                            <span class="card-label">总评论数</span>
+                        </div>
+                        <div class="summary-card">
+                            <span class="card-num" id="dash-main">0</span>
+                            <span class="card-label">主评论</span>
+                        </div>
+                        <div class="summary-card">
+                            <span class="card-num" id="dash-sub">0</span>
+                            <span class="card-label">楼中楼</span>
+                        </div>
+                    </div>
+                    <div class="dashboard-charts">
+                        <div class="chart-section">
+                            <h5>IP 属地分布 (Top 5)</h5>
+                            <div id="chart-ip" class="chart-container"></div>
+                        </div>
+                        <div class="chart-section-row">
+                            <div class="chart-section half">
+                                <h5>用户等级分布</h5>
+                                <div id="chart-level" class="chart-container"></div>
                             </div>
-                        </div>
-                        <div class="chart-section half">
-                            <h5>性别比例</h5>
-                            <div id="chart-sex" class="chart-container">
-                                <!-- Sex stats -->
+                            <div class="chart-section half">
+                                <h5>性别比例</h5>
+                                <div id="chart-sex" class="chart-container"></div>
                             </div>
                         </div>
                     </div>
-                </div>
-                
-                <div class="dashboard-footer" style="margin-top: 10px;">
-                    <button id="dashboard-download-btn" class="bili-cmt-btn primary" style="width: 100%;">重新下载 CSV 文件</button>
+                    <div class="dashboard-footer">
+                        <button id="dashboard-download-btn" class="bili-cmt-btn primary" style="width: 100%;">
+                            ${DOWNLOAD_ICON_SVG}<span>重新下载 CSV 文件</span>
+                        </button>
+                    </div>
                 </div>
             </div>
         `;
         document.body.appendChild(panel);
 
-        // Bind Events
-        floatBtn.addEventListener('click', () => {
-            if (panel.style.display === 'none') {
-                panel.style.display = 'flex';
-                handleUrlChange();
-            } else {
-                panel.style.display = 'none';
-            }
-        });
+        // ---------- 事件绑定 ----------
+        document.getElementById('bili-cmt-close-btn').addEventListener('click', () => togglePanel(false));
 
-        document.getElementById('bili-cmt-close-btn').addEventListener('click', () => {
-            panel.style.display = 'none';
-        });
-
-        // Tab switches
-        const tabs = document.querySelectorAll('.bili-cmt-tab');
-        tabs.forEach(tab => {
+        document.querySelectorAll('.bili-cmt-tab').forEach(tab => {
             tab.addEventListener('click', () => {
-                if (isExporting) return; // disable during active export
+                if (isExporting) return;
                 switchTab(tab.getAttribute('data-tab'));
             });
         });
 
-        // Cancel button
         document.getElementById('progress-cancel-btn').addEventListener('click', () => {
             shouldCancel = true;
-            log('正在取消导出进程，等待当前请求完成...', 'warn');
+            // 同时中断在途请求：否则最长要等一个 15s 超时的请求才能停下
+            if (exportController) exportController.abort();
+            log('正在取消导出，已中断在途请求...', 'warn');
         });
 
-        // Back from dashboard
-        document.getElementById('dashboard-back-btn').addEventListener('click', () => {
-            document.getElementById('bili-cmt-dashboard').style.display = 'none';
-        });
+        /**
+         * 统一收尾：无论正常结束还是用户中断，都把已抓取的数据落盘，避免几十分钟的抓取白费。
+         */
+        function finishExport(result, filename, interruptedLabel, doneLabel) {
+            const total = result.allComments.length;
+            const incomplete = !result.completed;
 
-        // Redownload CSV
-        document.getElementById('dashboard-download-btn').addEventListener('click', () => {
-            downloadCSV(currentExportedComments, currentFilename);
-        });
+            if (incomplete) {
+                log(`${interruptedLabel}：已抓取 ${total} 条，将保存已抓取的部分数据。`, 'warn');
+            }
+            if (total === 0) {
+                toast(incomplete ? '导出已中断，且未抓取到任何数据' : '没有抓取到任何评论数据', 'error', 5000);
+                return;
+            }
 
-        // Helper: enable/disable export buttons
-        function setExportButtonsEnabled(enabled) {
-            const videoBtn = document.getElementById('video-start-btn');
-            const upBtn = document.getElementById('up-start-btn');
-            if (videoBtn) { videoBtn.disabled = !enabled; videoBtn.style.opacity = enabled ? '1' : '0.5'; videoBtn.style.pointerEvents = enabled ? 'auto' : 'none'; }
-            if (upBtn) { upBtn.disabled = !enabled; upBtn.style.opacity = enabled ? '1' : '0.5'; upBtn.style.pointerEvents = enabled ? 'auto' : 'none'; }
+            const finalName = incomplete ? filename.replace(/\.csv$/i, '_中断.csv') : filename;
+            log('正在保存 CSV 文件...', 'success');
+            downloadCSV(result.allComments, finalName);
+            displayStats(result.allComments, result.stats, finalName, incomplete);
+
+            if (incomplete) {
+                toast(`已中断，已保存 ${total} 条评论（数据可能不完整）`, 'info', 5000);
+            } else {
+                toast(`${doneLabel}，共 ${total} 条评论，已开始下载 CSV`, 'success', 4200);
+            }
         }
 
-        // Start Video Export
+        document.getElementById('dashboard-back-btn').addEventListener('click', () => setView('form'));
+
+        document.getElementById('dashboard-download-btn').addEventListener('click', () => {
+            if (!currentExportedComments.length) {
+                toast('没有可重新下载的数据', 'error');
+                return;
+            }
+            downloadCSV(currentExportedComments, currentFilename);
+            toast('已开始下载 CSV 文件', 'success');
+        });
+
+        const bvidInput = document.getElementById('video-bvid');
+        const midInput = document.getElementById('up-mid');
+        bvidInput.addEventListener('input', () => { bvidTouched = true; });
+        midInput.addEventListener('input', () => { midTouched = true; });
+        bvidInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') document.getElementById('video-start-btn').click();
+        });
+
+        // ---------- 视频导出 ----------
         document.getElementById('video-start-btn').addEventListener('click', async () => {
             if (isExporting) return;
-            const bvidVal = document.getElementById('video-bvid').value;
-            const parsed = parseOidInput(bvidVal);
+            const parsed = parseOidInput(bvidInput.value);
             if (!parsed) {
-                alert("请输入合法的 BV 号或视频链接！");
+                flagInvalid(bvidInput, '请输入合法的 BV 号或视频链接');
                 return;
             }
-
-            const mode = parseInt(document.querySelector('input[name="video-order"]:checked').value);
+            // 文档：mode 2 = 仅按时间，3 = 仅按热度
+            const mode = parseInt(document.querySelector('input[name="video-order"]:checked').value, 10) === 2 ? 2 : 3;
             const includeSub = document.getElementById('video-subcomments').checked;
-            const limit = parseInt(document.getElementById('video-limit').value) || 0;
-            const delayVal = parseInt(document.getElementById('video-delay').value) || 500;
+            const limit = clampInt(document.getElementById('video-limit').value, 0, 100000, 0);
+            const delayVal = clampInt(document.getElementById('video-delay').value, 100, 10000, 500);
 
-            const progressPanel = document.getElementById('bili-cmt-progress-panel');
-            progressPanel.style.display = 'flex';
-            document.getElementById('progress-title').innerText = "视频评论导出中...";
-            document.getElementById('progress-bar-fill').style.width = '0%';
-            document.getElementById('stats-main').innerText = '0';
-            document.getElementById('stats-sub').innerText = '0';
-            document.getElementById('console-log').innerHTML = '';
-
+            persistSettings();
             isExporting = true;
             shouldCancel = false;
+            exportController = new AbortController();
             exportStartTime = Date.now();
-            setExportButtonsEnabled(false);
+            startProgressUI('视频评论导出中...');
 
             try {
-                const result = await exportVideoComments(parsed.oid, parsed.bvid, mode, includeSub, limit, delayVal);
-                isExporting = false;
-                setExportButtonsEnabled(true);
-
-                if (shouldCancel) {
-                    log('导出已被取消。', 'warn');
-                } else {
-                    log('导出顺利完成！正在保存文件...', 'success');
-                    const title = getVideoTitle();
-                    const filename = sanitizeFilename(`${title}_${parsed.bvid}_评论.csv`);
-                    downloadCSV(result.allComments, filename);
-                    displayStats(result.allComments, result.stats, filename);
-                }
+                const result = await exportVideoComments(
+                    parsed.oid,
+                    parsed.bvid,
+                    mode,
+                    includeSub,
+                    limit,
+                    delayVal,
+                    { signal: exportController.signal }
+                );
+                const title = getVideoTitle();
+                const filename = sanitizeFilename(`${title}_${parsed.bvid}_评论.csv`);
+                finishExport(result, filename, '导出已中断', '导出完成');
             } catch (err) {
+                if (isAbortError(err)) {
+                    log('导出已取消。', 'warn');
+                    toast('导出已取消', 'info');
+                } else {
+                    log(`导出失败：${err.message}`, 'error');
+                    toast(`导出失败：${err.message}`, 'error', 5000);
+                }
+            } finally {
                 isExporting = false;
-                setExportButtonsEnabled(true);
-                log(`发生严重错误: ${err.message}`, 'error');
+                exportController = null;
             }
         });
 
-        // Start UP space batch export
+        // ---------- UP 主批量导出 ----------
         document.getElementById('up-start-btn').addEventListener('click', async () => {
             if (isExporting) return;
-            const midVal = document.getElementById('up-mid').value;
-            const mid = parseMidInput(midVal);
-            if (!mid) {
-                alert("请输入合法的 UP 主 Mid 或主页链接！");
+            const parsedMid = parseMidInput(midInput.value);
+            if (!parsedMid) {
+                flagInvalid(midInput, '请输入合法的 UP 主 Mid 或主页链接');
                 return;
             }
-
-            const pages = parseInt(document.getElementById('up-pages').value) || 3;
-            const skip = parseInt(document.getElementById('up-skip').value) || 0;
+            const pages = clampInt(document.getElementById('up-pages').value, 1, 50, 3);
+            const skip = clampInt(document.getElementById('up-skip').value, 0, 10000, 0);
             const includeSub = document.getElementById('up-subcomments').checked;
-            const limit = parseInt(document.getElementById('up-video-limit').value) || 0;
-            const delayVal = parseInt(document.getElementById('up-delay').value) || 500;
+            const limit = clampInt(document.getElementById('up-video-limit').value, 0, 100000, 0);
+            const delayVal = clampInt(document.getElementById('up-delay').value, 100, 10000, 500);
 
-            const progressPanel = document.getElementById('bili-cmt-progress-panel');
-            progressPanel.style.display = 'flex';
-            document.getElementById('progress-title').innerText = "UP 视频批量导出中...";
-            document.getElementById('progress-bar-fill').style.width = '0%';
-            document.getElementById('stats-main').innerText = '0';
-            document.getElementById('stats-sub').innerText = '0';
-            document.getElementById('console-log').innerHTML = '';
-
+            persistSettings();
             isExporting = true;
             shouldCancel = false;
+            exportController = new AbortController();
             exportStartTime = Date.now();
-            setExportButtonsEnabled(false);
+            startProgressUI('UP 主视频批量导出中...');
 
             try {
-                const result = await exportUpComments(mid, pages, skip, includeSub, limit, delayVal);
-                isExporting = false;
-                setExportButtonsEnabled(true);
-
-                if (shouldCancel) {
-                    log('批量导出已被取消。', 'warn');
-                } else {
-                    log('批量导出顺利完成！正在保存文件...', 'success');
-                    const upName = getUpName();
-                    const filename = sanitizeFilename(`UP主_${upName || mid}_视频评论.csv`);
-                    downloadCSV(result.allComments, filename);
-                    displayStats(result.allComments, result.stats, filename);
-                }
+                const result = await exportUpComments(
+                    parsedMid,
+                    pages,
+                    skip,
+                    includeSub,
+                    limit,
+                    delayVal,
+                    { signal: exportController.signal }
+                );
+                const upName = getUpName();
+                const filename = sanitizeFilename(`UP主_${upName || parsedMid}_视频评论.csv`);
+                finishExport(result, filename, '批量导出已中断', '批量导出完成');
             } catch (err) {
+                if (isAbortError(err)) {
+                    log('批量导出已取消。', 'warn');
+                    toast('批量导出已取消', 'info');
+                } else {
+                    log(`批量导出失败：${err.message}`, 'error');
+                    toast(`批量导出失败：${err.message}`, 'error', 5000);
+                }
+            } finally {
                 isExporting = false;
-                setExportButtonsEnabled(true);
-                log(`批量导出发生严重错误: ${err.message}`, 'error');
+                exportController = null;
             }
         });
 
-        // Panel Drag Functionality
+        // ---------- 面板拖拽 ----------
         const header = panel.querySelector('.bili-cmt-header');
         let isDragging = false;
         let dragOffsetX = 0;
         let dragOffsetY = 0;
 
         header.addEventListener('mousedown', (e) => {
-            // Don't drag if clicking the close button
-            if (e.target.closest('.bili-cmt-close-btn')) return;
+            if (e.target.closest('.bili-cmt-icon-btn')) return;
             isDragging = true;
+            panel.classList.add('bili-cmt-dragging');
             const rect = panel.getBoundingClientRect();
             dragOffsetX = e.clientX - rect.left;
             dragOffsetY = e.clientY - rect.top;
@@ -2128,7 +2648,7 @@
         document.addEventListener('mousemove', (e) => {
             if (!isDragging) return;
             const newLeft = Math.max(0, Math.min(window.innerWidth - 100, e.clientX - dragOffsetX));
-            const newTop = Math.max(0, Math.min(window.innerHeight - 100, e.clientY - dragOffsetY));
+            const newTop = Math.max(0, Math.min(window.innerHeight - 60, e.clientY - dragOffsetY));
             panel.style.left = newLeft + 'px';
             panel.style.top = newTop + 'px';
             panel.style.right = 'auto';
@@ -2136,36 +2656,17 @@
         });
 
         document.addEventListener('mouseup', () => {
+            if (!isDragging) return;
             isDragging = false;
-        });
-
-        // Initialize state
-        handleUrlChange();
-    }
-
-    function switchTab(tabName) {
-        const tabs = document.querySelectorAll('.bili-cmt-tab');
-        const contents = document.querySelectorAll('.bili-cmt-tab-content');
-
-        tabs.forEach(t => {
-            if (t.getAttribute('data-tab') === tabName) {
-                t.classList.add('active');
-            } else {
-                t.classList.remove('active');
-            }
-        });
-
-        contents.forEach(c => {
-            if (c.getAttribute('id') === `tab-${tabName}`) {
-                c.classList.add('active');
-            } else {
-                c.classList.remove('active');
-            }
+            panel.classList.remove('bili-cmt-dragging');
         });
     }
 
+    // ---------- URL 上下文感知 ----------
     let lastDetectedBvid = '';
     let lastDetectedMid = '';
+    let bvidTouched = false;
+    let midTouched = false;
 
     function handleUrlChange() {
         const ctx = getPageContext();
@@ -2174,28 +2675,67 @@
 
         if (ctx.bvid && ctx.bvid !== lastDetectedBvid) {
             lastDetectedBvid = ctx.bvid;
-            if (bvidInput) {
+            if (bvidInput && (!bvidTouched || !bvidInput.value.trim())) {
                 bvidInput.value = ctx.bvid;
+                bvidTouched = false;
                 switchTab('video');
             }
         }
 
         if (ctx.mid && ctx.mid !== lastDetectedMid) {
             lastDetectedMid = ctx.mid;
-            if (midInput) {
+            if (midInput && (!midTouched || !midInput.value.trim())) {
                 midInput.value = ctx.mid;
+                midTouched = false;
                 switchTab('up');
             }
         }
+
+        // SPA 路由变化后工具栏可能被重建，尝试重新注入入口
+        if (!document.getElementById(ENTRY_BTN_ID)) tryInjectEntry();
     }
 
     // ==========================================
     // 11. Initializer & URL Watcher
     // ==========================================
-    createUI();
+    function init() {
+        if (document.getElementById('bili-cmt-panel')) return;
+
+        const style = document.createElement('style');
+        style.id = 'bili-cmt-styles';
+        style.textContent = CSS_STYLES;
+        document.head.appendChild(style);
+
+        buildToastContainer();
+        buildPanel();
+        watchThemeChanges();
+        watchEntryInjection();
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                const panel = document.getElementById('bili-cmt-panel');
+                if (panel && panel.classList.contains('bili-cmt-open')) {
+                    togglePanel(false);
+                }
+            }
+        });
+
+        // 页面加载初期定时重试注入（工具栏异步渲染），30 秒后放弃
+        let retries = 0;
+        const retryTimer = setInterval(() => {
+            retries += 1;
+            if (tryInjectEntry() || retries >= 60) clearInterval(retryTimer);
+        }, 500);
+
+        handleUrlChange();
+    }
 
     function watchUrlChanges() {
-        const notify = () => handleUrlChange();
+        const notify = () => {
+            try {
+                handleUrlChange();
+            } catch (e) { /* 不得让脚本异常传播进宿主页面的路由调用 */ }
+        };
         const origPushState = history.pushState;
         const origReplaceState = history.replaceState;
         history.pushState = function(...args) {
@@ -2209,6 +2749,7 @@
         window.addEventListener('popstate', notify);
     }
 
+    init();
     watchUrlChanges();
 
 })();
