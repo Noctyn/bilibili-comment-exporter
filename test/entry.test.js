@@ -66,7 +66,7 @@ test('路由切换后注入计时从头算，不沿用上一页的稳定窗口',
         // 模拟 SPA 跳转：路径变了才摘节点并重置计时
         globalThis.history.pushState({}, '', '/video/BV1ABCDEFGHJ');
 
-        assert.equal(document.getElementById('bili-cmt-entry').style.display, 'none', '跳转前必须把入口收起来');
+        assert.equal(document.getElementById('bili-cmt-entry'), null, '跳转前必须把入口摘掉');
         assert.equal(api.entryInjectAllowed(), false, '旧页面的稳定窗口不能带进新页面');
 
         // 看门狗/补枪在跳转后约 400ms 才发现「新」宿主，稳定期从那时重新起算
@@ -98,7 +98,7 @@ test('宿主被 Vue 整个换掉（脱离文档）后重新计时', async () => 
 test('页面彻底安静时，看门狗也能把入口补上', async () => {
     await withWatchdogStopped(async () => {
         setHost(3);
-        api.hideEntry();
+        api.removeEntry();
         api.resetEntryState();
         api.tryInjectEntry();          // 只观察，不放行
         await sleep(900);
@@ -107,26 +107,6 @@ test('页面彻底安静时，看门狗也能把入口补上', async () => {
         api.startEntryWatchdog();
         await sleep(700);
 
-        assert.notEqual(document.getElementById('bili-cmt-entry').style.display, 'none', '看门狗没能把入口补上');
-    });
-});
-
-test('工具栏内容变化后按钮落点会跟着校正', async () => {
-    await withWatchdogStopped(async () => {
-        const host = setHost(3);
-        api.resetEntryState();
-        api.tryInjectEntry();
-        await sleep(900);
-        assert.equal(api.tryInjectEntry(), true, '前置条件：先把入口摆出来');
-
-        const btn = document.getElementById('bili-cmt-entry');
-        const before = btn.style.transform;
-        // 模拟分享按钮变宽（数字加载 / 字体替换），右边缘从 100 挪到 260
-        host.lastElementChild.getBoundingClientRect = () => ({ left: 60, top: 10, right: 260, bottom: 50, width: 200, height: 40 });
-        api.repositionEntry();
-
-        const after = btn.style.transform;
-        assert.notEqual(after, before, '落点应随宿主变化更新');
-        assert.ok(after.indexOf('260px') >= 0, `应落在 60+200=260 处，实际 ${after}`);
+        assert.ok(document.getElementById('bili-cmt-entry'), '看门狗没能把入口补上');
     });
 });

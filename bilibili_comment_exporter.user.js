@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/bilibili-comment-exporter/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
-// @version      0.6.1
+// @version      0.5.3
 // @description  一款基于 Bilibili API 的视频评论区导出工具，入口集成在视频工具栏与 UP 主空间页中，支持导出主评论和楼中楼为 CSV（UTF-8 BOM 防乱码），并带有实时 IP 属地、等级及性别数据统计看板。
 // @author       heroxv
 // @license      MIT
@@ -640,35 +640,17 @@
     const BCE_FONT = '"PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
 
     const CSS_STYLES = `
-        /* ========== 入口浮层 ========== */
-        /* 按钮画在我们自己的层里，用坐标对齐到 B 站工具栏，不往它的组件树里插节点 */
-        .bili-cmt-entry-layer {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 0;
-            height: 0;
-            overflow: visible;
-            z-index: 1000;
-            pointer-events: none;
-        }
-        .bili-cmt-entry-layer > * { pointer-events: auto; }
-
         /* ========== 视频工具栏入口 ========== */
         .bili-cmt-entry {
-            position: absolute;
-            top: 0;
-            left: 0;
             display: flex;
             align-items: center;
             gap: 6px;
-            margin-left: 16px;
             cursor: pointer;
             font-size: 13px;
             font-weight: 500;
             line-height: 1;
             color: #61666d;
-            height: 30px;
+            height: 100%;
             padding: 0 6px;
             border-radius: 6px;
             user-select: none;
@@ -686,9 +668,6 @@
 
         /* ========== 空间页入口 ========== */
         .bili-cmt-entry-space {
-            position: absolute;
-            top: 0;
-            left: 0;
             display: inline-flex;
             align-items: center;
             justify-content: center;
@@ -2242,9 +2221,8 @@
     // ==========================================
     // 10. UI Generation & Control
     // ==========================================
-    const SCRIPT_VERSION = '0.6.1';
+    const SCRIPT_VERSION = '0.5.3';
     const ENTRY_BTN_ID = 'bili-cmt-entry';
-    const ENTRY_LAYER_ID = 'bili-cmt-entry-layer';
     const SETTINGS_KEY = 'biliCmtExporter.settings.v1';
 
     const ENTRY_ICON_SVG = '<svg viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" clip-rule="evenodd" d="M7.75 4.5H20.25A4.75 4.75 0 0 1 25 9.25V14.25A4.75 4.75 0 0 1 20.25 19H10.4L5.35 23.55C4.72 24.12 3.75 23.67 3.75 22.82V9.25A4.75 4.75 0 0 1 7.75 4.5ZM13.1 8.5h1.8v4.4l2.5-2.5 1.3 1.3-4.7 4.7-4.7-4.7 1.3-1.3 2.5 2.5V8.5Z"></path></svg>';
@@ -2435,8 +2413,11 @@
         });
     }
 
-    // ---------- 入口按钮 ----------
+    // ---------- 入口按钮注入 ----------
     function buildVideoEntry() {
+        const wrap = document.createElement('div');
+        wrap.className = 'toolbar-left-item-wrap';
+        wrap.setAttribute('data-bce', 'wrap');
         const btn = document.createElement('div');
         btn.id = ENTRY_BTN_ID;
         btn.className = 'bili-cmt-entry';
@@ -2456,7 +2437,8 @@
                 togglePanel(true);
             }
         });
-        return btn;
+        wrap.appendChild(btn);
+        return wrap;
     }
 
     function buildSpaceEntry(variant) {
@@ -2476,13 +2458,11 @@
         return btn;
     }
 
-    // ---------- 入口按钮：浮层渲染，不往 B 站容器里插节点 ----------
-    // 早期版本是把按钮 appendChild 到 B 站工具栏容器里。那等于往别人的 Vue 组件树里塞
-    // 一个它不认识的节点：赶上 hydration 或组件重建，Vue 按自己的 vnode 去做
-    // insertBefore / removeChild，撞上就抛错，整棵组件树中断渲染 —— 表现就是顶栏整块空白。
-    // 实测确认过：单独开本脚本不发病，和另一个脚本一起开就偶发（两份脚本的活动把 B 站
-    // 渲染的时间线推移了，注入恰好落进它的窗口）。
-    // 现在改成：按钮画在我们自己的浮层里，用坐标对齐到工具栏，B 站的 DOM 一个字都不写。
+    // ---------- 入口注入（不能打断 B 站 Vue 的渲染） ----------
+    // 往 B 站 Vue 管理的容器里插节点是有风险的：如果赶上 hydration 或组件卸载，
+    // Vue 会按自己的 vnode 树去 insertBefore / removeChild，撞到它不认识的节点就抛错，
+    // 整棵组件树中断渲染 —— 表现就是顶栏整块空白、评论区不加载。
+    // 所以两条规矩：① 等宿主容器稳定了再插；② 路由切换前先把自己的节点摘掉。
     const ENTRY_STABLE_MS = 800;      // 宿主容器连续安静这么久，才认为这一轮渲染结束
     const ENTRY_MAX_WAIT_MS = 4000;   // 兜底：等太久就不再看安静与否，避免活跃页面永远注入不了
     const ENTRY_WATCHDOG_FAST_MS = 400;    // 看门狗：刚进页面时高频补枪
@@ -2498,12 +2478,6 @@
     let watchdogTimer = null;
     let watchdogFast = true;
     let watchdogDeadline = 0;         // 高频阶段截止点，0 表示当前没在找入口
-    let entryLayer = null;            // 挂在 body 上的浮层，只装我们自己的节点
-    let entryBtn = null;
-    let entryBtnKey = '';             // 'video' / 'space:overlay'，变了才重建按钮
-    let entryVisible = false;         // 按钮当前是否摆在了工具栏旁边
-    let entryResizeObserver = null;   // 工具栏宽度变化（字体/数字加载）时校正落点
-    let placeRaf = 0;                 // 同一帧里的多次校正请求合并成一次
 
     if (document.readyState === 'complete') {
         pageLoadStamp = 0;
@@ -2515,13 +2489,13 @@
         if (/^\/video\//.test(window.location.pathname)) {
             for (const sel of VIDEO_ENTRY_HOSTS) {
                 const host = document.querySelector(sel);
-                if (host) return { host: host, kind: 'video', variant: '' };
+                if (host) return { host: host, build: buildVideoEntry };
             }
         }
         if (/space\.bilibili\.com$/.test(window.location.hostname)) {
             for (const item of SPACE_ENTRY_HOSTS) {
                 const host = document.querySelector(item.selector);
-                if (host) return { host: host, kind: 'space', variant: item.variant };
+                if (host) return { host: host, build: () => buildSpaceEntry(item.variant) };
             }
         }
         return null;
@@ -2534,41 +2508,14 @@
         hostQuietAt = Date.now();
         hostObserver = new MutationObserver(() => {
             hostQuietAt = Date.now();
-            // 工具栏内容变了（点赞数刷新、整块重建）都可能让按钮的落点偏移，
-            // 已经摆出来的按钮走 rAF 立刻校正，不等 400ms 的去抖
-            scheduleReposition();
-            if (!entryVisible) startEntryWatchdog();
+            // 按钮被 Vue 重渲染冲掉了，等这轮稳定后补回来
+            if (!document.getElementById(ENTRY_BTN_ID)) {
+                scheduleInject();
+                startEntryWatchdog();   // 入口被冲掉说明工具栏重建了，重新起一轮查找
+            }
         });
-        // 连同子树一起盯：点赞数这类文本变化也会改变右侧落点
-        hostObserver.observe(host, { childList: true, subtree: true, characterData: true });
-
-        // 字体加载完/替换后文字宽度会变，工具栏整体宽度的变化用 ResizeObserver 兜住，
-        // 它在绘制前触发，按钮不会闪一帧错位
-        if (typeof ResizeObserver === 'function') {
-            if (entryResizeObserver) entryResizeObserver.disconnect();
-            entryResizeObserver = new ResizeObserver(() => scheduleReposition());
-            entryResizeObserver.observe(host);
-        }
-    }
-
-    /** 已经摆出来的按钮做位置校正：不过稳定性那一关，只求跟手 */
-    function repositionEntry() {
-        if (!entryVisible || !entryBtn) return;
-        const found = findEntryHost();
-        if (!found || !found.host.isConnected) {
-            hideEntry();
-            return;
-        }
-        try { placeEntry(found); } catch (e) { /* 容器正好被换掉，等下一轮 */ }
-    }
-
-    /** 合并同一帧里的多次校正请求 */
-    function scheduleReposition() {
-        if (placeRaf || typeof requestAnimationFrame !== 'function') return;
-        placeRaf = requestAnimationFrame(() => {
-            placeRaf = 0;
-            repositionEntry();
-        });
+        // 只盯直接子节点：Vue 重建整块工具栏会命中，点赞数这类文本更新不会
+        hostObserver.observe(host, { childList: true });
     }
 
     /** 路由切换 / 宿主被换掉之后，注入计时全部从头来过，不能沿用上一页的稳定窗口 */
@@ -2577,73 +2524,18 @@
             hostObserver.disconnect();
             hostObserver = null;
         }
-        if (entryResizeObserver) {
-            entryResizeObserver.disconnect();
-            entryResizeObserver = null;
-        }
         observedHost = null;
         hostSeenAt = 0;
         hostQuietAt = 0;
     }
 
-    /** 浮层容器：只挂我们自己的节点，B 站的组件树里一个字都不写 */
-    function ensureEntryLayer() {
-        if (!document.body) return null;
-        if (entryLayer && entryLayer.isConnected) return entryLayer;
-        entryLayer = document.getElementById(ENTRY_LAYER_ID);
-        if (!entryLayer) {
-            entryLayer = document.createElement('div');
-            entryLayer.id = ENTRY_LAYER_ID;
-            entryLayer.className = 'bili-cmt-entry-layer';
-            document.body.appendChild(entryLayer);
-        }
-        return entryLayer;
-    }
-
-    function ensureEntryBtn(found) {
-        const layer = ensureEntryLayer();
-        if (!layer) return null;
-        const key = found.kind === 'space' ? 'space:' + (found.variant || '') : 'video';
-        if (entryBtn && entryBtnKey === key) return entryBtn;
-        // 视频页和空间页的按钮样式不同，换了场景就重建
-        if (entryBtn && entryBtn.parentNode) entryBtn.parentNode.removeChild(entryBtn);
-        entryBtn = found.kind === 'space' ? buildSpaceEntry(found.variant) : buildVideoEntry();
-        entryBtnKey = key;
-        entryBtn.style.display = 'none';
-        layer.appendChild(entryBtn);
-        syncDarkTheme();
-        return entryBtn;
-    }
-
-    /** 把按钮摆到宿主容器最后一个子项的右边，垂直居中 */
-    function placeEntry(found) {
-        const host = found.host;
-        const last = host.lastElementChild;
-        if (!last) return false;                       // 宿主还没渲染出内容
-
-        const btn = ensureEntryBtn(found);
-        if (!btn) return false;
-
-        const hostRect = host.getBoundingClientRect();
-        const lastRect = last.getBoundingClientRect();
-        if (!hostRect.width && !hostRect.height) return false;
-
-        // getBoundingClientRect 是视口坐标，浮层是 body 下的 absolute 容器，
-        // 要换算成文档坐标 —— 这样滚动时按钮跟着内容走，不用监听 scroll
-        const x = (window.pageXOffset || 0) + lastRect.right;
-        const y = (window.pageYOffset || 0) + lastRect.top + (lastRect.height - (btn.offsetHeight || 0)) / 2;
-
-        btn.style.display = '';
-        if (found.kind === 'video') btn.style.height = Math.round(lastRect.height) + 'px';
-        btn.style.transform = 'translate(' + Math.round(x) + 'px, ' + Math.round(y) + 'px)';
-        entryVisible = true;
-        return true;
-    }
-
-    /** 藏起来（路由切换 / 当前页面没有可注入的位置时调用） */
-    function hideEntry() {
-        entryVisible = false;
-        if (entryBtn) entryBtn.style.display = 'none';
+    /** 把注入的节点摘掉（连同外层包裹），路由切换前必须调用 */
+    function removeEntry() {
+        const btn = document.getElementById(ENTRY_BTN_ID);
+        if (!btn) return;
+        const wrap = btn.closest('[data-bce="wrap"]');
+        const target = wrap || btn;
+        if (target.parentNode) target.parentNode.removeChild(target);
     }
 
     function entryInjectAllowed() {
@@ -2661,27 +2553,28 @@
     }
 
     function tryInjectEntry() {
+        if (document.getElementById(ENTRY_BTN_ID)) return true;
+
         const found = findEntryHost();
         if (!found) {
-            // 首页这类没有注入位置的路由，计时清零、按钮收起来，下次进视频页重新算
+            // 首页这类没有注入位置的路由，计时清零，下次进视频页重新算
             resetEntryState();
-            hideEntry();
             return false;
         }
         if (!found.host.isConnected) {
             // 宿主已经被 Vue 整个换掉，等下一次找到新的容器
             resetEntryState();
-            hideEntry();
             return false;
         }
         if (observedHost !== found.host) observeEntryHost(found.host);
-        // 稳定性判断照旧：宿主还在动的时候连量坐标都不准
         if (!entryInjectAllowed()) return false;
 
         try {
-            return placeEntry(found);
+            found.host.appendChild(found.build());
+            syncDarkTheme();
+            return true;
         } catch (e) {
-            return false;   // 容器正好被换掉，等下一轮
+            return false;   // 容器正好被 Vue 换掉，等下一轮
         }
     }
 
@@ -3188,12 +3081,6 @@
             }
         });
 
-        // 窗口尺寸变了工具栏的落点也会变，重新摆一次
-        window.addEventListener('resize', scheduleReposition);
-        // 字体加载完成会改变工具栏文字宽度，按钮的落点要跟着挪
-        if (document.fonts && document.fonts.ready) {
-            document.fonts.ready.then(() => scheduleReposition()).catch(() => {});
-        }
         // 页面加载初期也要盯住（工具栏异步渲染），30 秒还没成功就放弃，
         // 交给看门狗按固定间隔补枪，不依赖页面是否继续产生 DOM 变动
         startEntryWatchdog();
@@ -3219,7 +3106,7 @@
             }
         };
         const detachBeforeRoute = () => {
-            try { hideEntry(); } catch (e) { /* 忽略 */ }
+            try { removeEntry(); } catch (e) { /* 忽略 */ }
             // 新页面的容器是重新渲染出来的，旧的稳定窗口必须作废
             resetEntryState();
         };
