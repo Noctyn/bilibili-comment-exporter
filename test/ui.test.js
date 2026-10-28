@@ -24,10 +24,18 @@ test('关键按钮的事件监听器都已绑定', () => {
 
 // ---------- 入口注入：不能在 B 站 Vue 渲染过程中插节点 ----------
 
-// 真实页面里宿主容器一定有内容（点赞 / 投币 / 分享…），空容器说明 Vue 还没渲染完。
+// 真实的 B 站工具栏里一定有内容（点赞 / 投币 / 分享…），空容器说明 Vue 还没渲染完。
 // 这里补一个占位子节点，让「宿主已经渲染出内容」这个前提成立。
 document.querySelector('.video-toolbar-container-main .video-toolbar-left-main')
     .appendChild(document.createElement('div'));
+
+/** 入口现在画在我们自己的浮层里，不再插进 B 站的容器 */
+function entryButton() {
+    return document.getElementById('bili-cmt-entry');
+}
+function entryLayer() {
+    return document.getElementById('bili-cmt-entry-layer');
+}
 
 test('宿主容器刚出现时不允许注入', () => {
     // 第一次调用只会记录宿主出现的时间，不会真的插入
@@ -45,17 +53,22 @@ test('宿主稳定 800ms 后才允许注入', async () => {
 
 test('重复触发注入不会插入第二个入口', () => {
     for (let i = 0; i < 5; i++) api.tryInjectEntry();
-    const host = document.querySelector('.video-toolbar-container-main .video-toolbar-left-main');
-    const wraps = host.children.filter(c => c.getAttribute && c.getAttribute('data-bce') === 'wrap');
-    assert.equal(wraps.length, 1, `宿主里有 ${wraps.length} 个入口包裹`);
+    const btns = entryLayer().children.filter(c => c.id === 'bili-cmt-entry');
+    assert.equal(btns.length, 1, `浮层里有 ${btns.length} 个入口按钮`);
 });
 
-test('removeEntry 连同外层包裹一起摘掉（路由切换前调用）', () => {
-    api.removeEntry();
-    assert.equal(document.getElementById('bili-cmt-entry'), null, '入口节点应已脱离文档');
+test('按钮画在我们自己的浮层里，B 站容器保持原样', () => {
     const host = document.querySelector('.video-toolbar-container-main .video-toolbar-left-main');
-    const wraps = host.children.filter(c => c.getAttribute && c.getAttribute('data-bce') === 'wrap');
-    assert.equal(wraps.length, 0, `宿主里还剩 ${wraps.length} 个入口包裹`);
+    // 宿主里除了测试自己补的占位子节点，不该有任何我们插入的东西
+    assert.equal(host.children.length, 1, 'B 站容器的子节点数不应被脚本改动');
+    assert.ok(entryButton(), '入口按钮应存在');
+    assert.equal(entryButton().parentNode, entryLayer(), '入口按钮应挂在我们的浮层里');
+});
+
+test('hideEntry 把按钮收起来，而不是从 B 站容器里摘节点', () => {
+    api.hideEntry();
+    assert.equal(entryButton().style.display, 'none', '入口应被隐藏');
+    assert.equal(entryLayer().children.length, 1, '按钮仍留在浮层里，不会被反复增删');
 });
 
 test('handleUrlChange 能从 URL 识别 BVID', () => {

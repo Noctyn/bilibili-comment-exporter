@@ -1,6 +1,6 @@
 {
   "name": "bilibili-comment-exporter",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "B 站评论区导出油猴脚本。此 package.json 仅用于离线测试，脚本本身无需构建，直接由用户脚本管理器加载。",

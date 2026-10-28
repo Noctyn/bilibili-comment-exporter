@@ -66,7 +66,7 @@ test('路由切换后注入计时从头算，不沿用上一页的稳定窗口',
         // 模拟 SPA 跳转：路径变了才摘节点并重置计时
         globalThis.history.pushState({}, '', '/video/BV1ABCDEFGHJ');
 
-        assert.equal(document.getElementById('bili-cmt-entry'), null, '跳转前必须把入口摘掉');
+        assert.equal(document.getElementById('bili-cmt-entry').style.display, 'none', '跳转前必须把入口收起来');
         assert.equal(api.entryInjectAllowed(), false, '旧页面的稳定窗口不能带进新页面');
 
         // 看门狗/补枪在跳转后约 400ms 才发现「新」宿主，稳定期从那时重新起算
@@ -98,7 +98,7 @@ test('宿主被 Vue 整个换掉（脱离文档）后重新计时', async () => 
 test('页面彻底安静时，看门狗也能把入口补上', async () => {
     await withWatchdogStopped(async () => {
         setHost(3);
-        api.removeEntry();
+        api.hideEntry();
         api.resetEntryState();
         api.tryInjectEntry();          // 只观察，不放行
         await sleep(900);
@@ -107,6 +107,6 @@ test('页面彻底安静时，看门狗也能把入口补上', async () => {
         api.startEntryWatchdog();
         await sleep(700);
 
-        assert.ok(document.getElementById('bili-cmt-entry'), '看门狗没能把入口补上');
+        assert.notEqual(document.getElementById('bili-cmt-entry').style.display, 'none', '看门狗没能把入口补上');
     });
 });

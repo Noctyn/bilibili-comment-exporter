@@ -23,7 +23,7 @@ const EXPOSE = `
         getCachedWbiKeys, invalidateWbiKeys, sleep, rateLimiter, buildCSVBlob,
         mapWithConcurrency, buildPanel, init, handleUrlChange, syncDarkTheme,
         startProgressUI, displayStats, setView, togglePanel, log, flushLogBuffer,
-        tryInjectEntry, removeEntry, entryInjectAllowed, scheduleInject, watchUrlChanges,
+        tryInjectEntry, hideEntry, entryInjectAllowed, scheduleInject, watchUrlChanges,
         resetEntryState, startEntryWatchdog, stopEntryWatchdog,
         setCancel: v => { shouldCancel = v; },
         setExportStart: v => { exportStartTime = v; },
@@ -121,6 +121,7 @@ function makeElement(ctx, id = '', isFragment = false) {
         children: [],
         parentNode: null,
         offsetWidth: 1,
+        offsetHeight: 34,
         scrollTop: 0,
         scrollHeight: 0,
         clientHeight: 0,
@@ -147,7 +148,7 @@ function makeElement(ctx, id = '', isFragment = false) {
         querySelector: () => makeElement(ctx),
         querySelectorAll: () => [],
         getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }),
-        // 脚本里只用到 [data-bce="wrap"] 和 .class 两种写法
+        // 脚本里 closest 只用到 .class 这一种写法（入口改为浮层后不再有包裹节点）
         closest(selector) {
             const attrMatch = selector.match(/^\[([\w-]+)="([^"]*)"\]$/);
             let node = el;
@@ -162,6 +163,9 @@ function makeElement(ctx, id = '', isFragment = false) {
     };
     Object.defineProperty(el, 'firstChild', {
         get: () => (el.children.length > 0 ? el.children[0] : null)
+    });
+    Object.defineProperty(el, 'lastElementChild', {
+        get: () => (el.children.length > 0 ? el.children[el.children.length - 1] : null)
     });
     Object.defineProperty(el, 'childElementCount', {
         get: () => el.children.length
@@ -190,7 +194,7 @@ export function loadBCE({ dom = 'null' } = {}) {
     const ctx = { listeners, byId };
 
     // 这两个容器初始不存在，buildPanel / buildToastContainer 才会真正执行创建逻辑
-    const createdByScript = new Set(['bili-cmt-panel', 'bili-cmt-toast-container']);
+    const createdByScript = new Set(['bili-cmt-panel', 'bili-cmt-toast-container', 'bili-cmt-entry-layer']);
     // 入口节点只能由 appendChild 注册，不能按需凭空创建，否则测不出重复注入
     const tracked = new Set(['bili-cmt-entry']);
 
@@ -257,6 +261,8 @@ export function loadBCE({ dom = 'null' } = {}) {
             hostname: 'www.bilibili.com'
         },
         addEventListener: noop,
+        pageXOffset: 0,
+        pageYOffset: 0,
         innerWidth: 1920,
         innerHeight: 1080
     };
