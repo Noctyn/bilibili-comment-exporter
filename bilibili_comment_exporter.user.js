@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/bilibili-comment-exporter/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
-// @version      0.5.1
+// @version      0.5.2
 // @description  一款基于 Bilibili API 的视频评论区导出工具，入口集成在视频工具栏与 UP 主空间页中，支持导出主评论和楼中楼为 CSV（UTF-8 BOM 防乱码），并带有实时 IP 属地、等级及性别数据统计看板。
 // @author       heroxv
 // @license      MIT
@@ -2221,7 +2221,7 @@
     // ==========================================
     // 10. UI Generation & Control
     // ==========================================
-    const SCRIPT_VERSION = '0.5.1';
+    const SCRIPT_VERSION = '0.5.2';
     const ENTRY_BTN_ID = 'bili-cmt-entry';
     const SETTINGS_KEY = 'biliCmtExporter.settings.v1';
 
@@ -2463,15 +2463,21 @@
     // Vue 会按自己的 vnode 树去 insertBefore / removeChild，撞到它不认识的节点就抛错，
     // 整棵组件树中断渲染 —— 表现就是顶栏整块空白、评论区不加载。
     // 所以两条规矩：① 等宿主容器稳定了再插；② 路由切换前先把自己的节点摘掉。
-    const ENTRY_STABLE_MS = 800;    // 宿主容器连续安静这么久，才认为这一轮渲染结束
-    const ENTRY_MAX_WAIT_MS = 4000; // 兜底：等太久就不再看安静与否，避免活跃页面永远注入不了
+    const ENTRY_STABLE_MS = 800;      // 宿主容器连续安静这么久，才认为这一轮渲染结束
+    const ENTRY_MAX_WAIT_MS = 4000;   // 兜底：等太久就不再看安静与否，避免活跃页面永远注入不了
+    const ENTRY_WATCHDOG_FAST_MS = 400;    // 看门狗：刚进页面时高频补枪
+    const ENTRY_WATCHDOG_SLOW_MS = 2000;   // 长时间没找到就降频，别一直空转
+    const ENTRY_WATCHDOG_FAST_MAX = 30000; // 高频阶段最多持续这么久
 
-    let pageLoadStamp = -1;         // -1 尚未 load；0 脚本运行时已 load；>0 load 时间戳
-    let hostSeenAt = 0;             // 首次发现宿主容器的时间
-    let hostQuietAt = 0;            // 宿主容器最后一次变动的时间
+    let pageLoadStamp = -1;           // -1 尚未 load；0 脚本运行时已 load；>0 load 时间戳
+    let hostSeenAt = 0;               // 首次发现宿主容器的时间
+    let hostQuietAt = 0;              // 宿主容器最后一次变动的时间
     let observedHost = null;
     let hostObserver = null;
     let injectTimer = null;
+    let watchdogTimer = null;
+    let watchdogFast = true;
+    let watchdogDeadline = 0;         // 高频阶段截止点，0 表示当前没在找入口
 
     if (document.readyState === 'complete') {
         pageLoadStamp = 0;
@@ -2503,10 +2509,24 @@
         hostObserver = new MutationObserver(() => {
             hostQuietAt = Date.now();
             // 按钮被 Vue 重渲染冲掉了，等这轮稳定后补回来
-            if (!document.getElementById(ENTRY_BTN_ID)) scheduleInject();
+            if (!document.getElementById(ENTRY_BTN_ID)) {
+                scheduleInject();
+                startEntryWatchdog();   // 入口被冲掉说明工具栏重建了，重新起一轮查找
+            }
         });
         // 只盯直接子节点：Vue 重建整块工具栏会命中，点赞数这类文本更新不会
         hostObserver.observe(host, { childList: true });
+    }
+
+    /** 路由切换 / 宿主被换掉之后，注入计时全部从头来过，不能沿用上一页的稳定窗口 */
+    function resetEntryState() {
+        if (hostObserver) {
+            hostObserver.disconnect();
+            hostObserver = null;
+        }
+        observedHost = null;
+        hostSeenAt = 0;
+        hostQuietAt = 0;
     }
 
     /** 把注入的节点摘掉（连同外层包裹），路由切换前必须调用 */
@@ -2527,6 +2547,8 @@
         // 2) 宿主容器出现后要稳定一段时间，说明 Vue 已经把这一轮渲染走完
         if (!hostSeenAt) return false;
         if (Date.now() - hostSeenAt > ENTRY_MAX_WAIT_MS) return true;
+        // 宿主自己还是空的，说明 Vue 还没往里渲染东西，这时候插进去最容易撞车
+        if (observedHost && observedHost.childElementCount === 0) return false;
         return (Date.now() - hostQuietAt) >= ENTRY_STABLE_MS;
     }
 
@@ -2535,7 +2557,13 @@
 
         const found = findEntryHost();
         if (!found) {
-            hostSeenAt = 0;
+            // 首页这类没有注入位置的路由，计时清零，下次进视频页重新算
+            resetEntryState();
+            return false;
+        }
+        if (!found.host.isConnected) {
+            // 宿主已经被 Vue 整个换掉，等下一次找到新的容器
+            resetEntryState();
             return false;
         }
         if (observedHost !== found.host) observeEntryHost(found.host);
@@ -2555,14 +2583,52 @@
         if (injectTimer) return;
         injectTimer = setTimeout(() => {
             injectTimer = null;
-            try { tryInjectEntry(); } catch (e) { /* 不污染宿主页面 */ }
+            let injected = false;
+            try { injected = tryInjectEntry(); } catch (e) { /* 不污染宿主页面 */ }
+            // 这一枪没成，而且还在查找窗口内，就交给看门狗接着补，
+            // 避免重试链断在一次失败上（窗口外不重启，免得定时器无限续命）
+            if (!injected && watchdogDeadline > Date.now()) startEntryWatchdog();
         }, delay);
     }
 
-    function watchEntryInjection() {
-        if (document.body) {
-            new MutationObserver(() => scheduleInject()).observe(document.body, { childList: true, subtree: true });
+    /**
+     * 看门狗：入口补枪不能只靠 DOM 事件。
+     * 页面渲染完就彻底安静了 —— 不再有变动、也就不会再触发重试，
+     * 于是入口永远不出现，表现为「从首页点进视频页没有入口，刷新一下就好了」。
+     * 所以这里独立于 DOM 事件按固定间隔补枪：
+     *   快节奏（400ms）找 30 秒，找不到就降到 2 秒继续盯，直到注入成功。
+     * 注入成功后整个定时器停掉，页面正常时零开销。
+     */
+    function startEntryWatchdog() {
+        watchdogDeadline = Date.now() + ENTRY_WATCHDOG_FAST_MAX;
+        if (watchdogTimer) return;
+
+        const tick = () => {
+            let injected = false;
+            try { injected = tryInjectEntry(); } catch (e) { /* 不污染宿主页面 */ }
+            if (injected) {
+                stopEntryWatchdog();
+                return;
+            }
+            // 快找阶段结束（页面可能长期没有可用宿主）就降频，别一直高频轮询
+            const fast = Date.now() <= watchdogDeadline;
+            if (fast !== watchdogFast) {
+                watchdogFast = fast;
+                clearInterval(watchdogTimer);
+                watchdogTimer = setInterval(tick, fast ? ENTRY_WATCHDOG_FAST_MS : ENTRY_WATCHDOG_SLOW_MS);
+            }
+        };
+
+        watchdogFast = true;
+        watchdogTimer = setInterval(tick, ENTRY_WATCHDOG_FAST_MS);
+    }
+
+    function stopEntryWatchdog() {
+        if (watchdogTimer) {
+            clearInterval(watchdogTimer);
+            watchdogTimer = null;
         }
+        watchdogDeadline = 0;
     }
 
     // ---------- 面板构建 ----------
@@ -2977,6 +3043,7 @@
 
         // SPA 路由变化后工具栏会被重建；这里只排队，具体注入时机由稳定性判断决定
         scheduleInject();
+        startEntryWatchdog();
     }
 
     // ==========================================
@@ -2984,6 +3051,14 @@
     // ==========================================
     function init() {
         if (document.getElementById('bili-cmt-panel')) return;
+
+        // 脚本在 document-end 就跑了，这时 B 站自己的 Vue 还在挂载组件。
+        // 我们这一步要往 <head> 塞样式、往 <body> 塞面板，DOM 量不小，
+        // 挤在别人的挂载过程里没有好处，等 load 之后再动手。
+        if (document.readyState !== 'complete') {
+            window.addEventListener('load', init, { once: true });
+            return;
+        }
 
         const style = document.createElement('style');
         style.id = 'bili-cmt-styles';
@@ -2993,7 +3068,9 @@
         buildToastContainer();
         buildPanel();
         watchThemeChanges();
-        watchEntryInjection();
+        // 不再观察整个 document.body：那会在 B 站每次渲染时把我们自己的代码
+        // 塞进同一个微任务队列，既是性能负担，也给了打断 Vue 渲染的机会。
+        // 入口补枪改由看门狗（见 startEntryWatchdog）按固定间隔完成。
 
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') {
@@ -3004,12 +3081,9 @@
             }
         });
 
-        // 页面加载初期定时重试注入（工具栏异步渲染），30 秒后放弃
-        let retries = 0;
-        const retryTimer = setInterval(() => {
-            retries += 1;
-            if (tryInjectEntry() || retries >= 60) clearInterval(retryTimer);
-        }, 500);
+        // 页面加载初期也要盯住（工具栏异步渲染），30 秒还没成功就放弃，
+        // 交给看门狗按固定间隔补枪，不依赖页面是否继续产生 DOM 变动
+        startEntryWatchdog();
 
         handleUrlChange();
     }
@@ -3033,6 +3107,8 @@
         };
         const detachBeforeRoute = () => {
             try { removeEntry(); } catch (e) { /* 忽略 */ }
+            // 新页面的容器是重新渲染出来的，旧的稳定窗口必须作废
+            resetEntryState();
         };
 
         const origPushState = history.pushState;

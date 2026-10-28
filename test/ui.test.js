@@ -24,6 +24,11 @@ test('关键按钮的事件监听器都已绑定', () => {
 
 // ---------- 入口注入：不能在 B 站 Vue 渲染过程中插节点 ----------
 
+// 真实页面里宿主容器一定有内容（点赞 / 投币 / 分享…），空容器说明 Vue 还没渲染完。
+// 这里补一个占位子节点，让「宿主已经渲染出内容」这个前提成立。
+document.querySelector('.video-toolbar-container-main .video-toolbar-left-main')
+    .appendChild(document.createElement('div'));
+
 test('宿主容器刚出现时不允许注入', () => {
     // 第一次调用只会记录宿主出现的时间，不会真的插入
     assert.equal(api.tryInjectEntry(), false);
@@ -49,11 +54,13 @@ test('removeEntry 连同外层包裹一起摘掉（路由切换前调用）', ()
     api.removeEntry();
     assert.equal(document.getElementById('bili-cmt-entry'), null, '入口节点应已脱离文档');
     const host = document.querySelector('.video-toolbar-container-main .video-toolbar-left-main');
-    assert.equal(host.children.length, 0, '外层包裹应一并移除');
+    const wraps = host.children.filter(c => c.getAttribute && c.getAttribute('data-bce') === 'wrap');
+    assert.equal(wraps.length, 0, `宿主里还剩 ${wraps.length} 个入口包裹`);
 });
 
 test('handleUrlChange 能从 URL 识别 BVID', () => {
     api.handleUrlChange();
+    api.stopEntryWatchdog();   // 别让看门狗把测试进程拖住
     assert.equal(document.getElementById('video-bvid').value, 'BV1e7NRemEwv');
 });
 

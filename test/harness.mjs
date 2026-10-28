@@ -24,6 +24,7 @@ const EXPOSE = `
         mapWithConcurrency, buildPanel, init, handleUrlChange, syncDarkTheme,
         startProgressUI, displayStats, setView, togglePanel, log, flushLogBuffer,
         tryInjectEntry, removeEntry, entryInjectAllowed, scheduleInject, watchUrlChanges,
+        resetEntryState, startEntryWatchdog, stopEntryWatchdog,
         setCancel: v => { shouldCancel = v; },
         setExportStart: v => { exportStartTime = v; },
         reset: () => { shouldCancel = false; isExporting = true; }
@@ -162,6 +163,12 @@ function makeElement(ctx, id = '', isFragment = false) {
     Object.defineProperty(el, 'firstChild', {
         get: () => (el.children.length > 0 ? el.children[0] : null)
     });
+    Object.defineProperty(el, 'childElementCount', {
+        get: () => el.children.length
+    });
+    Object.defineProperty(el, 'isConnected', {
+        get: () => (ctx.isConnected ? ctx.isConnected(el) : true)
+    });
     return el;
 }
 
@@ -201,6 +208,7 @@ export function loadBCE({ dom = 'null' } = {}) {
         while (n && n.parentNode && guard++ < 2000) n = n.parentNode;
         return n === bodyEl || n === headEl || n === docEl;
     }
+    ctx.isConnected = isConnected;
 
     globalThis.document = {
         readyState: 'complete',
