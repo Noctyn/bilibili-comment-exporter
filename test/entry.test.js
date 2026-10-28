@@ -110,3 +110,23 @@ test('页面彻底安静时，看门狗也能把入口补上', async () => {
         assert.notEqual(document.getElementById('bili-cmt-entry').style.display, 'none', '看门狗没能把入口补上');
     });
 });
+
+test('工具栏内容变化后按钮落点会跟着校正', async () => {
+    await withWatchdogStopped(async () => {
+        const host = setHost(3);
+        api.resetEntryState();
+        api.tryInjectEntry();
+        await sleep(900);
+        assert.equal(api.tryInjectEntry(), true, '前置条件：先把入口摆出来');
+
+        const btn = document.getElementById('bili-cmt-entry');
+        const before = btn.style.transform;
+        // 模拟分享按钮变宽（数字加载 / 字体替换），右边缘从 100 挪到 260
+        host.lastElementChild.getBoundingClientRect = () => ({ left: 60, top: 10, right: 260, bottom: 50, width: 200, height: 40 });
+        api.repositionEntry();
+
+        const after = btn.style.transform;
+        assert.notEqual(after, before, '落点应随宿主变化更新');
+        assert.ok(after.indexOf('260px') >= 0, `应落在 60+200=260 处，实际 ${after}`);
+    });
+});

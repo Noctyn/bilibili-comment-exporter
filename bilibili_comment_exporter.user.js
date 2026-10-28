@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/bilibili-comment-exporter/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
-// @version      0.6.0
+// @version      0.6.1
 // @description  一款基于 Bilibili API 的视频评论区导出工具，入口集成在视频工具栏与 UP 主空间页中，支持导出主评论和楼中楼为 CSV（UTF-8 BOM 防乱码），并带有实时 IP 属地、等级及性别数据统计看板。
 // @author       heroxv
 // @license      MIT
@@ -2242,7 +2242,7 @@
     // ==========================================
     // 10. UI Generation & Control
     // ==========================================
-    const SCRIPT_VERSION = '0.6.0';
+    const SCRIPT_VERSION = '0.6.1';
     const ENTRY_BTN_ID = 'bili-cmt-entry';
     const ENTRY_LAYER_ID = 'bili-cmt-entry-layer';
     const SETTINGS_KEY = 'biliCmtExporter.settings.v1';
@@ -2502,6 +2502,8 @@
     let entryBtn = null;
     let entryBtnKey = '';             // 'video' / 'space:overlay'，变了才重建按钮
     let entryVisible = false;         // 按钮当前是否摆在了工具栏旁边
+    let entryResizeObserver = null;   // 工具栏宽度变化（字体/数字加载）时校正落点
+    let placeRaf = 0;                 // 同一帧里的多次校正请求合并成一次
 
     if (document.readyState === 'complete') {
         pageLoadStamp = 0;
@@ -2532,12 +2534,41 @@
         hostQuietAt = Date.now();
         hostObserver = new MutationObserver(() => {
             hostQuietAt = Date.now();
-            // 工具栏内容变了（点赞数刷新、整块重建）都可能让按钮的落点偏移，重新摆一次
-            scheduleInject();
+            // 工具栏内容变了（点赞数刷新、整块重建）都可能让按钮的落点偏移，
+            // 已经摆出来的按钮走 rAF 立刻校正，不等 400ms 的去抖
+            scheduleReposition();
             if (!entryVisible) startEntryWatchdog();
         });
         // 连同子树一起盯：点赞数这类文本变化也会改变右侧落点
         hostObserver.observe(host, { childList: true, subtree: true, characterData: true });
+
+        // 字体加载完/替换后文字宽度会变，工具栏整体宽度的变化用 ResizeObserver 兜住，
+        // 它在绘制前触发，按钮不会闪一帧错位
+        if (typeof ResizeObserver === 'function') {
+            if (entryResizeObserver) entryResizeObserver.disconnect();
+            entryResizeObserver = new ResizeObserver(() => scheduleReposition());
+            entryResizeObserver.observe(host);
+        }
+    }
+
+    /** 已经摆出来的按钮做位置校正：不过稳定性那一关，只求跟手 */
+    function repositionEntry() {
+        if (!entryVisible || !entryBtn) return;
+        const found = findEntryHost();
+        if (!found || !found.host.isConnected) {
+            hideEntry();
+            return;
+        }
+        try { placeEntry(found); } catch (e) { /* 容器正好被换掉，等下一轮 */ }
+    }
+
+    /** 合并同一帧里的多次校正请求 */
+    function scheduleReposition() {
+        if (placeRaf || typeof requestAnimationFrame !== 'function') return;
+        placeRaf = requestAnimationFrame(() => {
+            placeRaf = 0;
+            repositionEntry();
+        });
     }
 
     /** 路由切换 / 宿主被换掉之后，注入计时全部从头来过，不能沿用上一页的稳定窗口 */
@@ -2545,6 +2576,10 @@
         if (hostObserver) {
             hostObserver.disconnect();
             hostObserver = null;
+        }
+        if (entryResizeObserver) {
+            entryResizeObserver.disconnect();
+            entryResizeObserver = null;
         }
         observedHost = null;
         hostSeenAt = 0;
@@ -3154,7 +3189,11 @@
         });
 
         // 窗口尺寸变了工具栏的落点也会变，重新摆一次
-        window.addEventListener('resize', () => scheduleInject(200));
+        window.addEventListener('resize', scheduleReposition);
+        // 字体加载完成会改变工具栏文字宽度，按钮的落点要跟着挪
+        if (document.fonts && document.fonts.ready) {
+            document.fonts.ready.then(() => scheduleReposition()).catch(() => {});
+        }
         // 页面加载初期也要盯住（工具栏异步渲染），30 秒还没成功就放弃，
         // 交给看门狗按固定间隔补枪，不依赖页面是否继续产生 DOM 变动
         startEntryWatchdog();

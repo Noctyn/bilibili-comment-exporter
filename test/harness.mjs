@@ -23,7 +23,7 @@ const EXPOSE = `
         getCachedWbiKeys, invalidateWbiKeys, sleep, rateLimiter, buildCSVBlob,
         mapWithConcurrency, buildPanel, init, handleUrlChange, syncDarkTheme,
         startProgressUI, displayStats, setView, togglePanel, log, flushLogBuffer,
-        tryInjectEntry, hideEntry, entryInjectAllowed, scheduleInject, watchUrlChanges,
+        tryInjectEntry, hideEntry, repositionEntry, entryInjectAllowed, scheduleInject, watchUrlChanges,
         resetEntryState, startEntryWatchdog, stopEntryWatchdog,
         setCancel: v => { shouldCancel = v; },
         setExportStart: v => { exportStartTime = v; },
@@ -147,7 +147,7 @@ function makeElement(ctx, id = '', isFragment = false) {
         removeEventListener: noop,
         querySelector: () => makeElement(ctx),
         querySelectorAll: () => [],
-        getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }),
+        getBoundingClientRect: () => ({ left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100 }),
         // 脚本里 closest 只用到 .class 这一种写法（入口改为浮层后不再有包裹节点）
         closest(selector) {
             const attrMatch = selector.match(/^\[([\w-]+)="([^"]*)"\]$/);
@@ -274,6 +274,9 @@ export function loadBCE({ dom = 'null' } = {}) {
     };
 
     globalThis.MutationObserver = class { observe() {} disconnect() {} };
+    globalThis.ResizeObserver = class { observe() {} disconnect() {} unobserve() {} };
+    globalThis.requestAnimationFrame = fn => setTimeout(fn, 0);
+    globalThis.cancelAnimationFrame = id => clearTimeout(id);
     globalThis.history = { pushState: noop, replaceState: noop };
     globalThis.Notification = class {
         static permission = 'denied';
