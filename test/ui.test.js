@@ -22,6 +22,36 @@ test('关键按钮的事件监听器都已绑定', () => {
     }
 });
 
+// ---------- 入口注入：不能在 B 站 Vue 渲染过程中插节点 ----------
+
+test('宿主容器刚出现时不允许注入', () => {
+    // 第一次调用只会记录宿主出现的时间，不会真的插入
+    assert.equal(api.tryInjectEntry(), false);
+    assert.equal(api.entryInjectAllowed(), false);
+    assert.equal(document.getElementById('bili-cmt-entry'), null);
+});
+
+test('宿主稳定 800ms 后才允许注入', async () => {
+    await new Promise(r => setTimeout(r, 900));
+    assert.equal(api.entryInjectAllowed(), true);
+    assert.equal(api.tryInjectEntry(), true);
+    assert.ok(document.getElementById('bili-cmt-entry'), '入口未插入');
+});
+
+test('重复触发注入不会插入第二个入口', () => {
+    for (let i = 0; i < 5; i++) api.tryInjectEntry();
+    const host = document.querySelector('.video-toolbar-container-main .video-toolbar-left-main');
+    const wraps = host.children.filter(c => c.getAttribute && c.getAttribute('data-bce') === 'wrap');
+    assert.equal(wraps.length, 1, `宿主里有 ${wraps.length} 个入口包裹`);
+});
+
+test('removeEntry 连同外层包裹一起摘掉（路由切换前调用）', () => {
+    api.removeEntry();
+    assert.equal(document.getElementById('bili-cmt-entry'), null, '入口节点应已脱离文档');
+    const host = document.querySelector('.video-toolbar-container-main .video-toolbar-left-main');
+    assert.equal(host.children.length, 0, '外层包裹应一并移除');
+});
+
 test('handleUrlChange 能从 URL 识别 BVID', () => {
     api.handleUrlChange();
     assert.equal(document.getElementById('video-bvid').value, 'BV1e7NRemEwv');

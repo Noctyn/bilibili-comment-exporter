@@ -23,6 +23,7 @@ const EXPOSE = `
         getCachedWbiKeys, invalidateWbiKeys, sleep, rateLimiter, buildCSVBlob,
         mapWithConcurrency, buildPanel, init, handleUrlChange, syncDarkTheme,
         startProgressUI, displayStats, setView, togglePanel, log, flushLogBuffer,
+        tryInjectEntry, removeEntry, entryInjectAllowed, scheduleInject, watchUrlChanges,
         setCancel: v => { shouldCancel = v; },
         setExportStart: v => { exportStartTime = v; },
         reset: () => { shouldCancel = false; isExporting = true; }
@@ -81,12 +82,32 @@ function makeEnv() {
     };
 }
 
-/** 极简元素桩：够 buildPanel 跑通，并记录事件监听器 */
-function makeElement(id, listeners, fragment = false) {
+/** 极简元素桩：够 buildPanel / 入口注入跑通，并记录事件监听器 */
+function makeElement(ctx, id = '', isFragment = false) {
+    const attrs = Object.create(null);
+
+    // 用内部函数而不是 el.appendChild：测试里会替换 appendChild 来统计调用次数，
+    // 片段展开不应再经过替换后的版本
+    function appendChildImpl(child) {
+        if (child && child.isFragment) {
+            const kids = child.children.slice();
+            child.children.length = 0;
+            for (const kid of kids) appendChildImpl(kid);
+            return child;
+        }
+        el.children.push(child);
+        if (child) {
+            child.parentNode = el;
+            child.__attached = true;
+            if (child.id) ctx.byId.set(child.id, child);
+        }
+        return child;
+    }
+
     const el = {
         id,
         tagName: 'DIV',
-        isFragment: fragment,
+        isFragment,
         style: {},
         dataset: {},
         className: '',
@@ -97,39 +118,47 @@ function makeElement(id, listeners, fragment = false) {
         value: '',
         checked: false,
         children: [],
+        parentNode: null,
         offsetWidth: 1,
         scrollTop: 0,
         scrollHeight: 0,
         clientHeight: 0,
         classList: { add: noop, remove: noop, toggle: noop, contains: () => false },
-        setAttribute: noop,
-        removeAttribute: noop,
-        getAttribute: () => null,
-        appendChild(child) {
-            if (child && child.isFragment) {
-                el.children.push(...child.children);
-            } else {
-                el.children.push(child);
-            }
-            return child;
-        },
+        setAttribute(name, value) { attrs[name] = String(value); },
+        getAttribute(name) { return name in attrs ? attrs[name] : null; },
+        removeAttribute(name) { delete attrs[name]; },
+        appendChild: appendChildImpl,
         removeChild(child) {
             const i = el.children.indexOf(child);
             if (i >= 0) el.children.splice(i, 1);
+            if (child) {
+                child.parentNode = null;
+                if (child.id && ctx.byId.get(child.id) === child) ctx.byId.delete(child.id);
+            }
             return child;
         },
         insertBefore: noop,
-        remove: noop,
+        remove() { if (el.parentNode) el.parentNode.removeChild(el); },
         focus: noop,
         click: noop,
-        addEventListener(type, fn) { listeners.set(`${id}:${type}`, fn); },
+        addEventListener(type, fn) { ctx.listeners.set(`${id}:${type}`, fn); },
         removeEventListener: noop,
-        querySelector: () => makeElement('', listeners),
+        querySelector: () => makeElement(ctx),
         querySelectorAll: () => [],
         getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }),
-        closest: () => null
+        // 脚本里只用到 [data-bce="wrap"] 和 .class 两种写法
+        closest(selector) {
+            const attrMatch = selector.match(/^\[([\w-]+)="([^"]*)"\]$/);
+            let node = el;
+            while (node) {
+                if (attrMatch && node.getAttribute && node.getAttribute(attrMatch[1]) === attrMatch[2]) return node;
+                if (!attrMatch && selector.startsWith('.') && node.className
+                    && String(node.className).split(/\s+/).includes(selector.slice(1))) return node;
+                node = node.parentNode;
+            }
+            return null;
+        }
     };
-    // firstChild 必须是动态的：脚本用 children.length + firstChild 做日志裁剪
     Object.defineProperty(el, 'firstChild', {
         get: () => (el.children.length > 0 ? el.children[0] : null)
     });
@@ -139,7 +168,7 @@ function makeElement(id, listeners, fragment = false) {
 /**
  * @param {{ dom?: 'null' | 'stub' }} options
  *   dom='null' 仅用于纯逻辑测试（所有 getElementById 返回 null）
- *   dom='stub' 用于 UI 冒烟测试（返回元素桩，可捕获事件监听器）
+ *   dom='stub' 用于 UI / 注入测试（返回元素桩，可捕获事件监听器）
  */
 export function loadBCE({ dom = 'null' } = {}) {
     let code = fs.readFileSync(SCRIPT_PATH, 'utf8');
@@ -151,35 +180,66 @@ export function loadBCE({ dom = 'null' } = {}) {
     const env = makeEnv();
     const listeners = new Map();
     const byId = new Map();
+    const ctx = { listeners, byId };
+
     // 这两个容器初始不存在，buildPanel / buildToastContainer 才会真正执行创建逻辑
-    const initiallyMissing = new Set(['bili-cmt-panel', 'bili-cmt-toast-container']);
+    const createdByScript = new Set(['bili-cmt-panel', 'bili-cmt-toast-container']);
+    // 入口节点只能由 appendChild 注册，不能按需凭空创建，否则测不出重复注入
+    const tracked = new Set(['bili-cmt-entry']);
+
+    const queryCache = new Map();
     const store = new Map();
 
-    const elements = {
-        createElement: () => makeElement('', listeners),
-        createDocumentFragment: () => makeElement('frag', listeners, true),
-        getElementById: id => {
-            if (dom === 'null') return null;
-            if (initiallyMissing.has(id)) return byId.get(id) || null;
-            if (!byId.has(id)) byId.set(id, makeElement(id, listeners));
-            return byId.get(id);
-        },
-        querySelector: () => (dom === 'null' ? null : makeElement('', listeners)),
-        querySelectorAll: () => [],
-        addEventListener: noop
-    };
+    const bodyEl = dom === 'null' ? { appendChild: noop, classList: { contains: () => false } } : makeElement(ctx, 'body');
+    const headEl = dom === 'null' ? { appendChild: noop } : makeElement(ctx, 'head');
+    const docEl = dom === 'null' ? { classList: { contains: () => false } } : makeElement(ctx, 'html');
+
+    /** 顺着 parentNode 往上走，看节点是否还挂在文档根上 */
+    function isConnected(node) {
+        let n = node;
+        let guard = 0;
+        while (n && n.parentNode && guard++ < 2000) n = n.parentNode;
+        return n === bodyEl || n === headEl || n === docEl;
+    }
 
     globalThis.document = {
         readyState: 'complete',
         title: '测试视频_哔哩哔哩_bilibili',
-        head: dom === 'null' ? { appendChild: noop } : makeElement('head', listeners),
-        body: dom === 'null'
-            ? { appendChild: noop, classList: { contains: () => false } }
-            : makeElement('body', listeners),
-        documentElement: dom === 'null'
-            ? { classList: { contains: () => false } }
-            : makeElement('html', listeners),
-        ...elements
+        head: headEl,
+        body: bodyEl,
+        documentElement: docEl,
+        createElement: () => makeElement(ctx),
+        createDocumentFragment: () => makeElement(ctx, 'frag', true),
+        getElementById: id => {
+            if (dom === 'null') return null;
+            const el = byId.get(id);
+            // 曾经挂到树上、现在已脱离文档的节点要当作不存在，
+            // 否则测不出「把外层包裹删掉后入口也跟着消失」这种场景
+            if (el && el.__attached && !isConnected(el)) {
+                byId.delete(id);
+                return null;
+            }
+            if (createdByScript.has(id) || tracked.has(id)) return el || null;
+            if (!el) {
+                const created = makeElement(ctx, id);
+                byId.set(id, created);
+                return created;
+            }
+            return el;
+        },
+        querySelector: sel => {
+            if (dom === 'null') return null;
+            if (!queryCache.has(sel)) {
+                // 真实 DOM 里 querySelector 的结果必然在文档中，这里也挂到 body 上，
+                // 否则「节点是否还在文档里」的判断会误伤
+                const found = makeElement(ctx);
+                bodyEl.appendChild(found);
+                queryCache.set(sel, found);
+            }
+            return queryCache.get(sel);
+        },
+        querySelectorAll: () => [],
+        addEventListener: noop
     };
 
     globalThis.window = {
@@ -211,7 +271,7 @@ export function loadBCE({ dom = 'null' } = {}) {
 
     new Function(code)();
 
-    return { api: globalThis.__BCE, env, listeners, byId, store };
+    return { api: globalThis.__BCE, env, listeners, byId, store, document: globalThis.document };
 }
 
 /** 构造一个最小可用的评论条目响应对象 */

@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/bilibili-comment-exporter/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/bilibili-comment-exporter/main/bilibili_comment_exporter.user.js
-// @version      0.5.0.1
+// @version      0.5.1
 // @description  一款基于 Bilibili API 的视频评论区导出工具，入口集成在视频工具栏与 UP 主空间页中，支持导出主评论和楼中楼为 CSV（UTF-8 BOM 防乱码），并带有实时 IP 属地、等级及性别数据统计看板。
 // @author       heroxv
 // @license      MIT
@@ -2221,7 +2221,7 @@
     // ==========================================
     // 10. UI Generation & Control
     // ==========================================
-    const SCRIPT_VERSION = '0.5.0';
+    const SCRIPT_VERSION = '0.5.1';
     const ENTRY_BTN_ID = 'bili-cmt-entry';
     const SETTINGS_KEY = 'biliCmtExporter.settings.v1';
 
@@ -2458,62 +2458,110 @@
         return btn;
     }
 
-    let pageLoadStamp = -1;
+    // ---------- 入口注入（不能打断 B 站 Vue 的渲染） ----------
+    // 往 B 站 Vue 管理的容器里插节点是有风险的：如果赶上 hydration 或组件卸载，
+    // Vue 会按自己的 vnode 树去 insertBefore / removeChild，撞到它不认识的节点就抛错，
+    // 整棵组件树中断渲染 —— 表现就是顶栏整块空白、评论区不加载。
+    // 所以两条规矩：① 等宿主容器稳定了再插；② 路由切换前先把自己的节点摘掉。
+    const ENTRY_STABLE_MS = 800;    // 宿主容器连续安静这么久，才认为这一轮渲染结束
+    const ENTRY_MAX_WAIT_MS = 4000; // 兜底：等太久就不再看安静与否，避免活跃页面永远注入不了
+
+    let pageLoadStamp = -1;         // -1 尚未 load；0 脚本运行时已 load；>0 load 时间戳
+    let hostSeenAt = 0;             // 首次发现宿主容器的时间
+    let hostQuietAt = 0;            // 宿主容器最后一次变动的时间
+    let observedHost = null;
+    let hostObserver = null;
+    let injectTimer = null;
+
     if (document.readyState === 'complete') {
         pageLoadStamp = 0;
     } else {
         window.addEventListener('load', () => { pageLoadStamp = Date.now(); }, { once: true });
     }
 
+    function findEntryHost() {
+        if (/^\/video\//.test(window.location.pathname)) {
+            for (const sel of VIDEO_ENTRY_HOSTS) {
+                const host = document.querySelector(sel);
+                if (host) return { host: host, build: buildVideoEntry };
+            }
+        }
+        if (/space\.bilibili\.com$/.test(window.location.hostname)) {
+            for (const item of SPACE_ENTRY_HOSTS) {
+                const host = document.querySelector(item.selector);
+                if (host) return { host: host, build: () => buildSpaceEntry(item.variant) };
+            }
+        }
+        return null;
+    }
+
+    function observeEntryHost(host) {
+        if (hostObserver) hostObserver.disconnect();
+        observedHost = host;
+        hostSeenAt = Date.now();
+        hostQuietAt = Date.now();
+        hostObserver = new MutationObserver(() => {
+            hostQuietAt = Date.now();
+            // 按钮被 Vue 重渲染冲掉了，等这轮稳定后补回来
+            if (!document.getElementById(ENTRY_BTN_ID)) scheduleInject();
+        });
+        // 只盯直接子节点：Vue 重建整块工具栏会命中，点赞数这类文本更新不会
+        hostObserver.observe(host, { childList: true });
+    }
+
+    /** 把注入的节点摘掉（连同外层包裹），路由切换前必须调用 */
+    function removeEntry() {
+        const btn = document.getElementById(ENTRY_BTN_ID);
+        if (!btn) return;
+        const wrap = btn.closest('[data-bce="wrap"]');
+        const target = wrap || btn;
+        if (target.parentNode) target.parentNode.removeChild(target);
+    }
+
     function entryInjectAllowed() {
-        // 必须等页面 load 完成后再向 B 站组件容器插入节点：
-        // 若在 Vue hydration 窗口期内注入，会打断其前端水合，导致顶栏、评论区等组件渲染异常。
-        if (pageLoadStamp === 0) return true;
-        if (pageLoadStamp > 0) return Date.now() - pageLoadStamp >= 1200;
-        return performance.now() >= 8000;
+        // 1) 页面没 load 完，一律不碰 B 站 DOM
+        if (pageLoadStamp < 0) return false;
+        const loadedAgo = pageLoadStamp === 0 ? Infinity : Date.now() - pageLoadStamp;
+        if (loadedAgo < 1200) return false;
+
+        // 2) 宿主容器出现后要稳定一段时间，说明 Vue 已经把这一轮渲染走完
+        if (!hostSeenAt) return false;
+        if (Date.now() - hostSeenAt > ENTRY_MAX_WAIT_MS) return true;
+        return (Date.now() - hostQuietAt) >= ENTRY_STABLE_MS;
     }
 
     function tryInjectEntry() {
         if (document.getElementById(ENTRY_BTN_ID)) return true;
+
+        const found = findEntryHost();
+        if (!found) {
+            hostSeenAt = 0;
+            return false;
+        }
+        if (observedHost !== found.host) observeEntryHost(found.host);
         if (!entryInjectAllowed()) return false;
-        const path = window.location.pathname;
 
-        if (/^\/video\//.test(path)) {
-            for (const sel of VIDEO_ENTRY_HOSTS) {
-                const host = document.querySelector(sel);
-                if (!host) continue;
-                host.appendChild(buildVideoEntry());
-                syncDarkTheme();
-                return true;
-            }
+        try {
+            found.host.appendChild(found.build());
+            syncDarkTheme();
+            return true;
+        } catch (e) {
+            return false;   // 容器正好被 Vue 换掉，等下一轮
         }
+    }
 
-        if (/space\.bilibili\.com$/.test(window.location.hostname)) {
-            for (const item of SPACE_ENTRY_HOSTS) {
-                const host = document.querySelector(item.selector);
-                if (!host) continue;
-                host.appendChild(buildSpaceEntry(item.variant));
-                syncDarkTheme();
-                return true;
-            }
-        }
-        return false;
+    /** 合并短时间内的多次触发，避免频繁操作 DOM */
+    function scheduleInject(delay = 400) {
+        if (injectTimer) return;
+        injectTimer = setTimeout(() => {
+            injectTimer = null;
+            try { tryInjectEntry(); } catch (e) { /* 不污染宿主页面 */ }
+        }, delay);
     }
 
     function watchEntryInjection() {
-        let timer = null;
-        const schedule = () => {
-            if (timer) return;
-            timer = setTimeout(() => {
-                timer = null;
-                try {
-                    // 注入成功后 tryInjectEntry 内部已同步主题，这里不再重复查询 DOM
-                    if (!document.getElementById(ENTRY_BTN_ID)) tryInjectEntry();
-                } catch (e) { /* 忽略 */ }
-            }, 400);
-        };
         if (document.body) {
-            new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true });
+            new MutationObserver(() => scheduleInject()).observe(document.body, { childList: true, subtree: true });
         }
     }
 
@@ -2927,8 +2975,8 @@
             }
         }
 
-        // SPA 路由变化后工具栏可能被重建，尝试重新注入入口
-        if (!document.getElementById(ENTRY_BTN_ID)) tryInjectEntry();
+        // SPA 路由变化后工具栏会被重建；这里只排队，具体注入时机由稳定性判断决定
+        scheduleInject();
     }
 
     // ==========================================
@@ -2968,21 +3016,44 @@
 
     function watchUrlChanges() {
         const notify = () => {
-            try {
-                handleUrlChange();
-            } catch (e) { /* 不得让脚本异常传播进宿主页面的路由调用 */ }
+            try { handleUrlChange(); } catch (e) { /* 不得让脚本异常传播进宿主页面的路由调用 */ }
         };
+
+        // 只有真的换了地址才摘节点：B 站会频繁 replaceState 更新 player 状态，
+        // 那种调用不该把按钮摘来摘去
+        const willNavigate = (args) => {
+            const url = args[2];
+            if (typeof url !== 'string' || !url) return false;
+            try {
+                const next = new URL(url, window.location.href);
+                return next.pathname !== window.location.pathname || next.search !== window.location.search;
+            } catch (e) {
+                return false;
+            }
+        };
+        const detachBeforeRoute = () => {
+            try { removeEntry(); } catch (e) { /* 忽略 */ }
+        };
+
         const origPushState = history.pushState;
         const origReplaceState = history.replaceState;
         history.pushState = function (...args) {
-            origPushState.apply(this, args);
+            // 必须在 B 站路由真正执行之前摘掉：否则旧组件卸载时会撞到我们的节点而抛错
+            if (willNavigate(args)) detachBeforeRoute();
+            const ret = origPushState.apply(this, args);
             notify();
+            return ret;
         };
         history.replaceState = function (...args) {
-            origReplaceState.apply(this, args);
+            if (willNavigate(args)) detachBeforeRoute();
+            const ret = origReplaceState.apply(this, args);
             notify();
+            return ret;
         };
-        window.addEventListener('popstate', notify);
+        window.addEventListener('popstate', () => {
+            detachBeforeRoute();
+            notify();
+        });
     }
 
     init();
